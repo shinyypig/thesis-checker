@@ -25,6 +25,7 @@
 3. **Structure Extractor**
     - Detects chapters/sections/subsections, paragraphs, figures, tables, equations, references, labels.
     - Captures source ranges (line/column) for every element to support diagnostics.
+    - Display math delimiters `\[...\]` and `$$...$$` are converted into `equation` elements (with delimiter metadata) so block formulas are traceable even without explicit environments; inline math is ignored to avoid noisy diagnostics.
 4. **Sentence Segmenter**
     - Uses the `sentence-splitter` library to segment multilingual text safely (handles decimals, abbreviations, etc.) and records exact ranges for each sentence.
 5. **JSON Serializer**

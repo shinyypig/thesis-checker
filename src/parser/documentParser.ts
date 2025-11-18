@@ -124,6 +124,22 @@ export class DocumentParser {
                 continue;
             }
 
+            const displayMath = this.extractDisplayMath(lineWithoutComments);
+            for (const math of displayMath) {
+                const start = new vscode.Position(lineNumber, math.start);
+                const end = new vscode.Position(lineNumber, math.end);
+                elements.push({
+                    type: "equation",
+                    content: math.content,
+                    filePath,
+                    range: new vscode.Range(start, end),
+                    metadata: {
+                        inline: math.inline,
+                        delimiter: math.delimiter,
+                    },
+                });
+            }
+
             const sentences =
                 this.extractSentenceFragments(lineWithoutComments);
             for (const sentence of sentences) {
@@ -216,6 +232,28 @@ export class DocumentParser {
             endLine: Math.min(currentLine, lines.length - 1),
         };
     }
+
+    private extractDisplayMath(text: string): DisplayMathFragment[] {
+        if (!text) {
+            return [];
+        }
+        const fragments: DisplayMathFragment[] = [];
+        for (const pattern of DISPLAY_MATH_PATTERNS) {
+            pattern.regex.lastIndex = 0;
+            let match: RegExpExecArray | null;
+            while ((match = pattern.regex.exec(text)) !== null) {
+                const raw = match[0];
+                fragments.push({
+                    content: raw,
+                    start: match.index,
+                    end: match.index + raw.length,
+                    inline: pattern.inline,
+                    delimiter: pattern.delimiter,
+                });
+            }
+        }
+        return fragments;
+    }
 }
 
 interface SentenceFragment {
@@ -235,3 +273,20 @@ function isTxtNode(node: unknown): node is SentenceSplitterTxtNode {
         node && typeof (node as SentenceSplitterTxtNode).type === "string"
     );
 }
+
+interface DisplayMathFragment {
+    content: string;
+    start: number;
+    end: number;
+    inline: boolean;
+    delimiter: "bracket" | "dollar";
+}
+
+const DISPLAY_MATH_PATTERNS: {
+    regex: RegExp;
+    inline: boolean;
+    delimiter: DisplayMathFragment["delimiter"];
+}[] = [
+    { regex: /\\\[(.+?)\\\]/g, inline: false, delimiter: "bracket" },
+    { regex: /\$\$(.+?)\$\$/g, inline: false, delimiter: "dollar" },
+];
