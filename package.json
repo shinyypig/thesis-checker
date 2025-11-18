@@ -9,15 +9,78 @@
   "categories": [
     "Other"
   ],
-  "activationEvents": [],
+  "activationEvents": [
+    "onCommand:thesis-checker.scanWorkspace",
+    "onCommand:thesis-checker.exportStructure"
+  ],
   "main": "./dist/extension.js",
   "contributes": {
     "commands": [
       {
-        "command": "thesis-checker.helloWorld",
-        "title": "Hello World"
+        "command": "thesis-checker.scanWorkspace",
+        "title": "Thesis Checker: Scan Workspace"
+      },
+      {
+        "command": "thesis-checker.exportStructure",
+        "title": "Thesis Checker: Export Structured JSON"
       }
-    ]
+    ],
+    "configuration": {
+      "title": "Thesis Checker",
+      "properties": {
+        "thesisChecker.logic.minimumSentencesPerSection": {
+          "type": "number",
+          "default": 3,
+          "minimum": 0,
+          "markdownDescription": "Minimum recommended sentence count per section before raising a warning."
+        },
+        "thesisChecker.llm.enabled": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Enable LLM-powered analysis. Requires provider-specific configuration."
+        },
+        "thesisChecker.llm.provider": {
+          "type": "string",
+          "enum": [
+            "openai",
+            "ollama"
+          ],
+          "default": "openai",
+          "markdownDescription": "LLM provider to use for AI-based review."
+        },
+        "thesisChecker.llm.openaiApiKey": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "API key for OpenAI-compatible endpoints."
+        },
+        "thesisChecker.llm.openaiModel": {
+          "type": "string",
+          "default": "gpt-3.5-turbo",
+          "markdownDescription": "Model name for OpenAI-style providers."
+        },
+        "thesisChecker.llm.openaiBaseUrl": {
+          "type": "string",
+          "default": "https://api.openai.com/v1/chat/completions",
+          "markdownDescription": "Override the OpenAI API endpoint (useful for Azure/OpenAI-compatible gateways)."
+        },
+        "thesisChecker.llm.ollamaEndpoint": {
+          "type": "string",
+          "default": "http://localhost:11434",
+          "markdownDescription": "Ollama HTTP endpoint."
+        },
+        "thesisChecker.llm.ollamaModel": {
+          "type": "string",
+          "default": "llama3",
+          "markdownDescription": "Model to use when calling Ollama."
+        },
+        "thesisChecker.llm.maxItems": {
+          "type": "number",
+          "default": 20,
+          "minimum": 1,
+          "markdownDescription": "Maximum number of elements (sentences/equations) to send to the LLM per run."
+        }
+      }
+    }
   },
   "scripts": {
     "vscode:prepublish": "npm run package",
