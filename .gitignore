@@ -2,4 +2,7 @@ out
 dist
 node_modules
 .vscode-test/
+.vscode/thesis-checker/
 *.vsix
+.DS_Store
+test_thesis

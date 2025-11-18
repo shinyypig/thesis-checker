@@ -26,7 +26,7 @@
     - Detects chapters/sections/subsections, paragraphs, figures, tables, equations, references, labels.
     - Captures source ranges (line/column) for every element to support diagnostics.
 4. **Sentence Segmenter**
-    - Splits plain text nodes into sentences using multilingual punctuation rules; stores references to parent sections.
+    - Uses the `sentence-splitter` library to segment multilingual text safely (handles decimals, abbreviations, etc.) and records exact ranges for each sentence.
 5. **JSON Serializer**
     - Produces a flat, ordered array describing every discovered element in document order:
         ```json
