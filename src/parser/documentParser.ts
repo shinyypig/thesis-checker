@@ -240,10 +240,16 @@ export class DocumentParser {
     }
 
     private normalizeSentenceContent(content: string): string | null {
-        const withoutMath = this.removeInlineMathSegments(content);
-        const stripped = this.stripLatexCommands(withoutMath);
+        const withoutDisplayMath = this.removeDisplayMathSegments(content);
+        const stripped = this.stripLatexCommands(withoutDisplayMath);
         const collapsed = stripped.replace(/\s+/g, " ").trim();
         if (!collapsed) {
+            return null;
+        }
+        if (this.isPureCommandLine(withoutDisplayMath)) {
+            return null;
+        }
+        if (!this.hasTextualPayload(withoutDisplayMath)) {
             return null;
         }
         if (!/[\p{Letter}\p{Number}]/u.test(collapsed)) {
@@ -259,12 +265,10 @@ export class DocumentParser {
         return collapsed;
     }
 
-    private removeInlineMathSegments(text: string): string {
+    private removeDisplayMathSegments(text: string): string {
         return text
             .replace(/\\\[(?:[\s\S]*?)\\\]/g, " ")
-            .replace(/\\\((?:[\s\S]*?)\\\)/g, " ")
-            .replace(/\$\$(?:[\s\S]*?)\$\$/g, " ")
-            .replace(/\$(?:\\.|[^$\\])+\$/g, " ");
+            .replace(/\$\$(?:[\s\S]*?)\$\$/g, " ");
     }
 
     private stripLatexCommands(text: string): string {
@@ -281,59 +285,19 @@ export class DocumentParser {
             }
 
             if (char === "\\") {
+                const commandStart = index;
                 const parsed = this.readCommandName(text, index + 1);
                 if (!parsed) {
                     index++;
                     continue;
                 }
-                index = parsed.newIndex;
-
-                if (parsed.isSymbol) {
-                    if (parsed.command === "\\" || /\s/.test(parsed.command)) {
-                        result += " ";
-                    } else {
-                        result += parsed.command;
-                    }
-                    continue;
-                }
-
-                const normalized = parsed.command.replace(/\*+$/, "");
-                const lower = normalized.toLowerCase();
-
-                if (WHITESPACE_LATEX_COMMANDS.has(lower)) {
-                    result += " ";
-                }
-
-                index = this.skipWhitespace(text, index);
-
-                while (text[index] === "[") {
-                    const optional = this.extractBracketContent(
-                        text,
-                        index,
-                        "[",
-                        "]"
-                    );
-                    if (!optional) {
-                        break;
-                    }
-                    index = optional.endIndex;
-                    index = this.skipWhitespace(text, index);
-                }
-
-                let argumentIndex = 0;
-                while (text[index] === "{") {
-                    const block = this.extractBracedContent(text, index);
-                    if (!block) {
-                        break;
-                    }
-                    argumentIndex += 1;
-                    if (this.shouldPreserveArgument(lower, argumentIndex)) {
-                        const inner = this.stripLatexCommands(block.content);
-                        result += this.wrapPreservedArgument(lower, inner);
-                    }
-                    index = block.endIndex;
-                    index = this.skipWhitespace(text, index);
-                }
+                const literal = this.extractLiteralCommand(
+                    text,
+                    commandStart,
+                    parsed.newIndex
+                );
+                result += literal.raw;
+                index = literal.endIndex;
 
                 continue;
             }
@@ -349,6 +313,143 @@ export class DocumentParser {
         }
 
         return result;
+    }
+
+    private isPureCommandLine(text: string): boolean {
+        const trimmed = text.trim();
+        if (!trimmed) {
+            return true;
+        }
+        if (/\$|\\\(|\\\)/.test(trimmed)) {
+            return false;
+        }
+        return /^(\\[a-zA-Z@]+\\*?(?:\s*\[[^\]]*\]|\s*\{[^}]*\})*\s*)+[。！？.!?：:；;，,]*$/.test(
+            trimmed
+        );
+    }
+
+    private hasTextualPayload(text: string): boolean {
+        let index = 0;
+        while (index < text.length) {
+            const char = text[index];
+            if (/\s/.test(char)) {
+                index++;
+                continue;
+            }
+            if (char === "\\") {
+                const parsed = this.readCommandName(text, index + 1);
+                if (!parsed) {
+                    index++;
+                    continue;
+                }
+                let cursor = parsed.newIndex;
+                let advanced = false;
+                while (cursor < text.length) {
+                    let next = cursor;
+                    while (next < text.length && /\s/.test(text[next])) {
+                        next++;
+                    }
+                    if (text[next] === "[") {
+                        const block = this.extractBracketContent(
+                            text,
+                            next,
+                            "[",
+                            "]"
+                        );
+                        if (!block) {
+                            break;
+                        }
+                        if (this.containsText(block.content)) {
+                            return true;
+                        }
+                        cursor = block.endIndex;
+                        advanced = true;
+                        continue;
+                    }
+                    if (text[next] === "{") {
+                        const block = this.extractBracedContent(text, next);
+                        if (!block) {
+                            break;
+                        }
+                        if (this.containsText(block.content)) {
+                            return true;
+                        }
+                        cursor = block.endIndex;
+                        advanced = true;
+                        continue;
+                    }
+                    break;
+                }
+                index = advanced ? cursor : parsed.newIndex;
+                continue;
+            }
+            if (char === "$") {
+                return true;
+            }
+            if (/[\p{Letter}\p{Number}]/u.test(char)) {
+                return true;
+            }
+            index++;
+        }
+        return false;
+    }
+
+    private containsText(value: string): boolean {
+        if (!value) {
+            return false;
+        }
+        if (/[\p{Letter}\p{Number}]/u.test(value)) {
+            return true;
+        }
+        if (value.includes("$") || value.includes("\\(") || value.includes("\\[")) {
+            return true;
+        }
+        return false;
+    }
+
+    private extractLiteralCommand(
+        text: string,
+        commandStart: number,
+        afterCommand: number
+    ): { raw: string; endIndex: number } {
+        let cursor = afterCommand;
+        let lastEnd = afterCommand;
+
+        while (cursor < text.length) {
+            let next = cursor;
+            while (next < text.length && /\s/.test(text[next])) {
+                next++;
+            }
+            if (text[next] === "[") {
+                const block = this.extractBracketContent(
+                    text,
+                    next,
+                    "[",
+                    "]"
+                );
+                if (!block) {
+                    break;
+                }
+                cursor = block.endIndex;
+                lastEnd = cursor;
+                continue;
+            }
+            if (text[next] === "{") {
+                const block = this.extractBracedContent(text, next);
+                if (!block) {
+                    break;
+                }
+                cursor = block.endIndex;
+                lastEnd = cursor;
+                continue;
+            }
+            break;
+        }
+
+        return {
+            raw: text.slice(commandStart, lastEnd),
+            endIndex: lastEnd,
+        };
     }
 
     private readCommandName(
@@ -381,14 +482,6 @@ export class DocumentParser {
         };
     }
 
-    private skipWhitespace(text: string, start: number): number {
-        let index = start;
-        while (index < text.length && /\s/.test(text[index])) {
-            index++;
-        }
-        return index;
-    }
-
     private extractBracketContent(
         text: string,
         start: number,
@@ -415,33 +508,6 @@ export class DocumentParser {
             content: text.slice(start + 1, index - 1),
             endIndex: index,
         };
-    }
-
-    private shouldPreserveArgument(
-        command: string,
-        argumentIndex: number
-    ): boolean {
-        if (TEXTUAL_COMMANDS.has(command)) {
-            return argumentIndex === 1;
-        }
-        if (TEXTUAL_SECOND_ARGUMENT_COMMANDS.has(command)) {
-            return argumentIndex === 2;
-        }
-        return false;
-    }
-
-    private wrapPreservedArgument(
-        command: string,
-        content: string
-    ): string {
-        const trimmed = content.trim();
-        if (!trimmed) {
-            return "";
-        }
-        if (PARENTHESIZED_LATEX_COMMANDS.has(command)) {
-            return ` (${trimmed})`;
-        }
-        return trimmed;
     }
 
     private extractBracedContent(
@@ -620,52 +686,3 @@ interface CommandParseResult {
     newIndex: number;
     isSymbol: boolean;
 }
-
-const TEXTUAL_COMMANDS = new Set([
-    "emph",
-    "mbox",
-    "text",
-    "textbf",
-    "textit",
-    "textmd",
-    "textnormal",
-    "textrm",
-    "textsc",
-    "textsf",
-    "textsl",
-    "textsubscript",
-    "textsuperscript",
-    "texttt",
-    "textup",
-    "underline",
-    "autoref",
-    "cref",
-    "eqref",
-    "ref",
-]);
-
-const TEXTUAL_SECOND_ARGUMENT_COMMANDS = new Set([
-    "colorbox",
-    "fcolorbox",
-    "href",
-    "textcolor",
-]);
-
-const PARENTHESIZED_LATEX_COMMANDS = new Set([
-    "autoref",
-    "cref",
-    "eqref",
-    "ref",
-]);
-
-const WHITESPACE_LATEX_COMMANDS = new Set([
-    "bigskip",
-    "clearpage",
-    "linebreak",
-    "medskip",
-    "newline",
-    "newpage",
-    "pagebreak",
-    "par",
-    "smallskip",
-]);

@@ -13,6 +13,11 @@
     "onStartupFinished",
     "workspaceContains:**/*.tex",
     "onCommand:thesis-checker.scanWorkspace",
+    "onCommand:thesis-checker.parseWorkspace",
+    "onCommand:thesis-checker.parseWorkspaceRescan",
+    "onCommand:thesis-checker.runLogicAnalyzer",
+    "onCommand:thesis-checker.runLlmAnalyzer",
+    "onCommand:thesis-checker.rescanWorkspace",
     "onCommand:thesis-checker.exportStructure"
   ],
   "main": "./dist/extension.js",
@@ -21,6 +26,26 @@
       {
         "command": "thesis-checker.scanWorkspace",
         "title": "Thesis Checker: Scan Workspace"
+      },
+      {
+        "command": "thesis-checker.parseWorkspace",
+        "title": "Thesis Checker: Parse Workspace"
+      },
+      {
+        "command": "thesis-checker.parseWorkspaceRescan",
+        "title": "Thesis Checker: Parse Workspace (Rescan & Clear Cache)"
+      },
+      {
+        "command": "thesis-checker.runLogicAnalyzer",
+        "title": "Thesis Checker: Run Logic Analyzer"
+      },
+      {
+        "command": "thesis-checker.runLlmAnalyzer",
+        "title": "Thesis Checker: Run LLM Analyzer"
+      },
+      {
+        "command": "thesis-checker.rescanWorkspace",
+        "title": "Thesis Checker: Rescan Workspace (Ignore Cache)"
       },
       {
         "command": "thesis-checker.exportStructure",

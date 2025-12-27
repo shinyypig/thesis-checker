@@ -6,6 +6,8 @@ import { LogicAnalyzer } from './analyzers/logicAnalyzer';
 import { LLMAnalyzer } from './analyzers/llmAnalyzer';
 import { AnalyzerDiagnostic, DocumentElement } from './types';
 
+const CACHE_VERSION = 2;
+
 export function activate(context: vscode.ExtensionContext) {
 	const diagnostics = vscode.languages.createDiagnosticCollection('thesis-checker');
 	context.subscriptions.push(diagnostics);
@@ -17,6 +19,21 @@ export function activate(context: vscode.ExtensionContext) {
 
 	context.subscriptions.push(
 		vscode.commands.registerCommand('thesis-checker.scanWorkspace', () => controller.runFullAnalysis()),
+		vscode.commands.registerCommand('thesis-checker.parseWorkspace', () =>
+			controller.runFullAnalysis({ mode: 'parse' })
+		),
+		vscode.commands.registerCommand('thesis-checker.parseWorkspaceRescan', () =>
+			controller.runFullAnalysis({ mode: 'parse', force: true })
+		),
+		vscode.commands.registerCommand('thesis-checker.runLogicAnalyzer', () =>
+			controller.runFullAnalysis({ mode: 'logic' })
+		),
+		vscode.commands.registerCommand('thesis-checker.runLlmAnalyzer', () =>
+			controller.runFullAnalysis({ mode: 'llm' })
+		),
+		vscode.commands.registerCommand('thesis-checker.rescanWorkspace', () =>
+			controller.runFullAnalysis({ force: true, mode: 'full' })
+		),
 		vscode.commands.registerCommand('thesis-checker.exportStructure', () => controller.exportStructure())
 	);
 }
@@ -31,6 +48,7 @@ class ThesisCheckerController implements vscode.Disposable {
 	private readonly llmAnalyzer = new LLMAnalyzer();
 	private readonly statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
 	private latestElements: DocumentElement[] = [];
+	private elementKeyCache: Map<DocumentElement, string> | null = null;
 
 	constructor(private readonly diagnosticCollection: vscode.DiagnosticCollection) {
 		this.statusBarItem.command = 'thesis-checker.scanWorkspace';
@@ -62,13 +80,22 @@ class ThesisCheckerController implements vscode.Disposable {
 		this.publishDiagnostics(diagnostics);
 	}
 
-	public async runFullAnalysis(): Promise<void> {
+	public async runFullAnalysis(options?: { force?: boolean; mode?: AnalysisMode }): Promise<void> {
 		if (!vscode.workspace.workspaceFolders?.length) {
 			vscode.window.showWarningMessage('Open a workspace before running Thesis Checker.');
 			return;
 		}
 
 		try {
+			const force = Boolean(options?.force);
+			const mode = options?.mode ?? 'full';
+			const runLogic = mode === 'full' || mode === 'logic';
+			const runLlm = mode === 'full' || mode === 'llm';
+			const parseOnly = mode === 'parse';
+
+			if (force) {
+				this.diagnosticCollection.clear();
+			}
 			await vscode.window.withProgress(
 				{
 					location: vscode.ProgressLocation.Notification,
@@ -79,6 +106,7 @@ class ThesisCheckerController implements vscode.Disposable {
 					progress.report({ message: 'Parsing LaTeX files...' });
 					const elements = await this.parser.parseWorkspace();
 					this.latestElements = elements;
+					this.elementKeyCache = this.buildElementKeyCache(elements);
 
 					if (elements.length === 0) {
 						this.diagnosticCollection.clear();
@@ -87,94 +115,165 @@ class ThesisCheckerController implements vscode.Disposable {
 					}
 
 					const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
-					const parseCache = workspaceFolder
-						? await this.loadParseCache(workspaceFolder, 'current')
-						: undefined;
+					if (workspaceFolder && force) {
+						await this.clearAllCaches(workspaceFolder);
+					}
+					const parseCache =
+						workspaceFolder && !force ? await this.loadParseCache(workspaceFolder, 'current') : undefined;
 					const elementCache = this.buildElementCache(elements, parseCache);
-					const logicCache = workspaceFolder
-						? await this.loadDiagnosticsCache(workspaceFolder, 'logic', 'current')
-						: undefined;
-					const llmCache = workspaceFolder
-						? await this.loadDiagnosticsCache(workspaceFolder, 'llm', 'current')
-						: undefined;
+					let logicCache: DiagnosticsCache | undefined;
+					if (workspaceFolder && !force) {
+						if (runLogic) {
+							await this.promoteDiagnosticsCache(workspaceFolder, 'logic');
+							logicCache = await this.loadDiagnosticsCache(workspaceFolder, 'logic', 'prev');
+						} else {
+							logicCache = await this.loadDiagnosticsCache(workspaceFolder, 'logic', 'current');
+						}
+					}
+					let llmCache: DiagnosticsCache | undefined;
+					if (workspaceFolder && !force) {
+						if (runLlm) {
+							await this.promoteDiagnosticsCache(workspaceFolder, 'llm');
+							llmCache = await this.loadDiagnosticsCache(workspaceFolder, 'llm', 'prev');
+						} else {
+							llmCache = await this.loadDiagnosticsCache(workspaceFolder, 'llm', 'current');
+						}
+					}
 					const parseCacheAvailable = Boolean(parseCache?.elements);
-					const logicCacheAvailable = parseCacheAvailable && Boolean(logicCache?.diagnostics?.length);
-					const llmCacheAvailable = parseCacheAvailable && Boolean(llmCache?.diagnostics?.length);
+					const logicBaselineKeys = this.collectBaselineKeys(logicCache);
+					const llmBaselineKeys = this.collectBaselineKeys(llmCache);
+					const logicCacheAvailable = !force && logicBaselineKeys.size > 0;
+					const llmCacheAvailable = !force && llmBaselineKeys.size > 0;
+					const incrementalSummary = parseCacheAvailable
+						? this.formatIncrementalSummary(elementCache)
+						: undefined;
 					const sentenceElements = elements.filter((element) => element.type === 'sentence');
-					const changedSentenceElements = elementCache.changedElements.filter(
-						(element) => element.type === 'sentence'
+					const currentSentenceKeys = new Set(
+						sentenceElements.map((element) => this.buildElementKey(element))
 					);
-					const changedSentenceKeys = new Set(
-						changedSentenceElements.map((element) => this.buildElementKey(element))
-					);
-					const changedCaptionKeys = new Set(
-						elementCache.changedElements
-							.filter((element) => element.type === 'figure' || element.type === 'table')
-							.map((element) => this.buildElementKey(element))
-					);
-					const sectionFilesToRecheck = this.collectSectionFilesToRecheck(elementCache);
-					const abbreviationStartIndex = this.findEarliestChangedSentenceIndex(
-						sentenceElements,
-						elementCache.unchangedKeys,
-						elementCache.removedSentence
-					);
-					const elementKeyByLocation = this.buildElementKeyMap(elements);
 					const currentKeys = new Set(Object.keys(elementCache.entries));
-
-					progress.report({ message: 'Running logic checks...' });
-					let logicDiagnostics: AnalyzerDiagnostic[] = [];
-					let logicRecheckKeys = new Set<string>();
+					const elementKeyByLocation = this.buildElementKeyMap(elements);
+					const llmRecheckKeys = runLlm
+						? (llmCacheAvailable
+							? this.collectRecheckKeys(currentSentenceKeys, llmBaselineKeys)
+							: new Set(currentSentenceKeys))
+						: new Set<string>();
+					let changedSentenceKeys = new Set<string>();
+					let changedCaptionKeys = new Set<string>();
+					let sectionFilesToRecheck = new Set<string>();
+					let abbreviationStartIndex: number | undefined;
+					let logicHasRemovals = false;
 					if (logicCacheAvailable) {
-						const abbreviationTargets = this.collectSentenceKeysFromIndex(
+						changedSentenceKeys = this.collectChangedSentenceKeys(sentenceElements, logicBaselineKeys);
+						changedCaptionKeys = this.collectChangedCaptionKeys(elements, logicBaselineKeys);
+						logicHasRemovals = this.hasRemovedKeys(currentKeys, logicBaselineKeys);
+						abbreviationStartIndex = this.findEarliestChangedSentenceIndex(
 							sentenceElements,
-							abbreviationStartIndex
+							logicBaselineKeys,
+							logicHasRemovals
 						);
-						const sectionTargets = this.collectSectionKeysForFiles(
+						sectionFilesToRecheck = this.collectSectionFilesForLogic(
 							elements,
-							sectionFilesToRecheck
+							logicBaselineKeys,
+							changedSentenceKeys,
+							logicHasRemovals
 						);
-						logicRecheckKeys = new Set([
-							...changedSentenceKeys,
-							...changedCaptionKeys,
-							...sectionTargets,
-							...abbreviationTargets
-						]);
-						logicDiagnostics = this.logicAnalyzer.analyzeIncremental(elements, {
-							punctuationTargets: changedSentenceKeys,
-							captionTargets: changedCaptionKeys,
-							abbreviationStartIndex,
-							sectionFilesToRecheck,
-							elementKeyFor: this.buildElementKey.bind(this)
-						});
-					} else {
-						logicDiagnostics = this.logicAnalyzer.analyze(elements);
-						logicRecheckKeys = new Set(currentKeys);
 					}
 
-					progress.report({ message: 'Running LLM analysis (if enabled)...' });
-					const llmDiagnostics = await this.llmAnalyzer.analyze(changedSentenceElements);
-					const unchangedSentenceKeys = new Set(
-						sentenceElements
-							.filter((element) => elementCache.unchangedKeys.has(this.buildElementKey(element)))
-							.map((element) => this.buildElementKey(element))
-					);
+					if (workspaceFolder) {
+						await this.saveParseCache(workspaceFolder, {
+							version: CACHE_VERSION,
+							generatedAt: new Date().toISOString(),
+							elements: elementCache.entries
+						});
+					}
+
+					if (parseOnly) {
+						const message = incrementalSummary
+							? `Thesis Checker parsed ${elements.length} elements. ${incrementalSummary}.`
+							: `Thesis Checker parsed ${elements.length} elements.`;
+						vscode.window.showInformationMessage(message);
+						return;
+					}
+
+					if (runLogic) {
+						progress.report({ message: 'Running logic checks...' });
+					}
+					let logicDiagnostics: AnalyzerDiagnostic[] = [];
+					let logicRecheckKeys = new Set<string>();
+					let logicAnalyzedCount = 0;
+					if (logicCacheAvailable) {
+						if (runLogic) {
+							const abbreviationTargets = this.collectSentenceKeysFromIndex(
+								sentenceElements,
+								abbreviationStartIndex
+							);
+							const sectionTargets = this.collectSectionKeysForFiles(
+								elements,
+								sectionFilesToRecheck
+							);
+							logicRecheckKeys = new Set([
+								...changedSentenceKeys,
+								...changedCaptionKeys,
+								...sectionTargets,
+								...abbreviationTargets
+							]);
+							logicDiagnostics = this.logicAnalyzer.analyzeIncremental(elements, {
+								punctuationTargets: changedSentenceKeys,
+								captionTargets: changedCaptionKeys,
+								abbreviationStartIndex,
+								sectionFilesToRecheck,
+								elementKeyFor: this.buildElementKey.bind(this)
+							});
+							logicAnalyzedCount = logicRecheckKeys.size;
+						} else {
+							logicRecheckKeys = new Set<string>();
+						}
+					} else if (runLogic) {
+						logicDiagnostics = this.logicAnalyzer.analyze(elements);
+						logicRecheckKeys = new Set(currentKeys);
+						logicAnalyzedCount = currentKeys.size;
+					} else {
+						logicRecheckKeys = new Set<string>();
+					}
+
+					if (runLlm) {
+						progress.report({ message: 'Running LLM analysis (if enabled)...' });
+					}
 					const cachedLlmEntries = llmCacheAvailable
 						? this.filterCachedLlmEntries(
 							llmCache,
-							unchangedSentenceKeys,
-							currentKeys
+							llmRecheckKeys,
+							currentSentenceKeys
 						)
 						: [];
 					const cachedLogicEntries = logicCacheAvailable
 						? this.filterCachedLogicEntries(logicCache, logicRecheckKeys, currentKeys)
 						: [];
-					const cachedLlmDiagnostics = this.deserializeDiagnostics(cachedLlmEntries);
-					const cachedLogicDiagnostics = this.deserializeDiagnostics(cachedLogicEntries);
-
-					const combinedDiagnostics = [
+					const cachedLlmDiagnostics = this.deserializeDiagnostics(cachedLlmEntries, elementCache.entries);
+					const cachedLogicDiagnostics = this.deserializeDiagnostics(cachedLogicEntries, elementCache.entries);
+					const baseDiagnostics = [
 						...cachedLogicDiagnostics,
 						...cachedLlmDiagnostics,
-						...logicDiagnostics,
+						...logicDiagnostics
+					];
+					const streamingLlmDiagnostics: AnalyzerDiagnostic[] = [];
+					const llmTargets = runLlm
+						? sentenceElements.filter((element) => llmRecheckKeys.has(this.buildElementKey(element)))
+						: [];
+					const llmDiagnostics = runLlm
+						? await this.llmAnalyzer.analyze(llmTargets, {
+							progress,
+							onDiagnostics: (items) => {
+								streamingLlmDiagnostics.push(...items);
+								this.publishDiagnostics([...baseDiagnostics, ...streamingLlmDiagnostics]);
+							}
+						})
+						: [];
+					const llmAnalyzedCount = runLlm ? llmTargets.length : 0;
+
+					const combinedDiagnostics = [
+						...baseDiagnostics,
 						...llmDiagnostics
 					];
 
@@ -184,31 +283,45 @@ class ThesisCheckerController implements vscode.Disposable {
 							[...logicDiagnostics, ...llmDiagnostics],
 							elementKeyByLocation
 						);
-						await this.saveParseCache(workspaceFolder, {
-							version: 1,
-							generatedAt: new Date().toISOString(),
-							elements: elementCache.entries
-						});
-						await this.saveDiagnosticsCache(workspaceFolder, 'logic', {
-							version: 1,
-							generatedAt: new Date().toISOString(),
-							diagnostics: [
-								...cachedLogicEntries,
-								...freshDiagnostics.filter(
-									(entry) => entry.source !== undefined && !entry.source.startsWith('LLM:')
-								)
-							]
-						});
-						await this.saveDiagnosticsCache(workspaceFolder, 'llm', {
-							version: 1,
-							generatedAt: new Date().toISOString(),
-							diagnostics: [
-								...cachedLlmEntries,
-								...freshDiagnostics.filter((entry) => entry.source?.startsWith('LLM:'))
-							]
-						});
+						if (runLogic) {
+							await this.saveDiagnosticsCache(workspaceFolder, 'logic', {
+								version: CACHE_VERSION,
+								generatedAt: new Date().toISOString(),
+								diagnostics: [
+									...cachedLogicEntries,
+									...freshDiagnostics.filter(
+										(entry) => entry.source !== undefined && !entry.source.startsWith('LLM:')
+									)
+								],
+								elementKeys: [...currentKeys]
+							});
+						}
+						if (runLlm) {
+							await this.saveDiagnosticsCache(workspaceFolder, 'llm', {
+								version: CACHE_VERSION,
+								generatedAt: new Date().toISOString(),
+								diagnostics: [
+									...cachedLlmEntries,
+									...freshDiagnostics.filter((entry) => entry.source?.startsWith('LLM:'))
+								],
+								elementKeys: [...currentSentenceKeys]
+							});
+						}
 					}
-					vscode.window.showInformationMessage(`Thesis Checker analyzed ${elements.length} elements.`);
+					const message =
+						mode === 'logic'
+							? 'Thesis Checker finished logic analysis.'
+							: mode === 'llm'
+								? 'Thesis Checker finished LLM analysis.'
+								: 'Thesis Checker analyzed elements.';
+					const summary =
+						mode === 'logic'
+							? this.formatAnalyzedSummary(logicAnalyzedCount)
+							: mode === 'llm'
+								? this.formatAnalyzedSummary(llmAnalyzedCount)
+								: incrementalSummary;
+					const suffix = summary ? ` ${summary}.` : '';
+					vscode.window.showInformationMessage(`${message}${suffix}`);
 				}
 			);
 		} catch (error) {
@@ -228,9 +341,10 @@ class ThesisCheckerController implements vscode.Disposable {
 			if (!workspaceFolder) {
 				return;
 			}
+			this.elementKeyCache = this.buildElementKeyCache(this.latestElements);
 			const elementCache = this.buildElementCache(this.latestElements, undefined);
 			await this.saveParseCache(workspaceFolder, {
-				version: 1,
+				version: CACHE_VERSION,
 				generatedAt: new Date().toISOString(),
 				elements: elementCache.entries
 			});
@@ -256,10 +370,23 @@ class ThesisCheckerController implements vscode.Disposable {
 		}
 	}
 
+	private formatIncrementalSummary(cache: ElementCacheResult): string {
+		const added = cache.newKeys.size;
+		const deleted = cache.removedKeys.size;
+		return `${added} added, ${deleted} deleted`;
+	}
+
+	private formatAnalyzedSummary(count: number): string {
+		const label = count === 1 ? 'item' : 'items';
+		return `${count} ${label} analyzed`;
+	}
+
 	private buildElementCache(elements: DocumentElement[], cache?: ParseCache): ElementCacheResult {
 		const entries: Record<string, CachedElement> = {};
 		const changedElements: DocumentElement[] = [];
 		const unchangedKeys = new Set<string>();
+		const newKeys = new Set<string>();
+		const modifiedKeys = new Set<string>();
 		const previous = cache?.elements ?? {};
 
 		for (const element of elements) {
@@ -274,9 +401,13 @@ class ThesisCheckerController implements vscode.Disposable {
 				metadata: element.metadata ?? {}
 			};
 
-			if (previous[key]?.hash === hash) {
+			if (!previous[key]) {
+				newKeys.add(key);
+				changedElements.push(element);
+			} else if (previous[key]?.hash === hash) {
 				unchangedKeys.add(key);
 			} else {
+				modifiedKeys.add(key);
 				changedElements.push(element);
 			}
 		}
@@ -299,20 +430,85 @@ class ThesisCheckerController implements vscode.Disposable {
 			entries,
 			changedElements,
 			unchangedKeys,
+			newKeys,
+			modifiedKeys,
 			removedKeys,
 			removedFiles,
 			removedSentence
 		};
 	}
 
-	private collectSectionFilesToRecheck(cache: ElementCacheResult): Set<string> {
-		const files = new Set<string>(cache.removedFiles);
-		for (const element of cache.changedElements) {
-			if (element.type === 'sentence' || this.isSectionType(element.type)) {
-				files.add(element.filePath);
+	private collectChangedSentenceKeys(
+		sentences: DocumentElement[],
+		baselineKeys: Set<string>
+	): Set<string> {
+		const keys = new Set<string>();
+		for (const element of sentences) {
+			const key = this.buildElementKey(element);
+			if (!baselineKeys.has(key)) {
+				keys.add(key);
+			}
+		}
+		return keys;
+	}
+
+	private collectChangedCaptionKeys(
+		elements: DocumentElement[],
+		baselineKeys: Set<string>
+	): Set<string> {
+		const keys = new Set<string>();
+		for (const element of elements) {
+			if (element.type !== 'figure' && element.type !== 'table') {
+				continue;
+			}
+			const key = this.buildElementKey(element);
+			if (!baselineKeys.has(key)) {
+				keys.add(key);
+			}
+		}
+		return keys;
+	}
+
+	private collectSectionFilesForLogic(
+		elements: DocumentElement[],
+		baselineKeys: Set<string>,
+		changedSentenceKeys: Set<string>,
+		hasRemovals: boolean
+	): Set<string> {
+		const files = new Set<string>();
+		if (hasRemovals) {
+			for (const element of elements) {
+				if (this.isSectionType(element.type)) {
+					files.add(element.filePath);
+				}
+			}
+			return files;
+		}
+		for (const element of elements) {
+			if (element.type === 'sentence') {
+				const key = this.buildElementKey(element);
+				if (changedSentenceKeys.has(key)) {
+					files.add(element.filePath);
+				}
+				continue;
+			}
+			if (this.isSectionType(element.type)) {
+				const key = this.buildElementKey(element);
+				if (!baselineKeys.has(key)) {
+					files.add(element.filePath);
+				}
 			}
 		}
 		return files;
+	}
+
+	private hasRemovedKeys(currentKeys: Set<string>, baselineKeys: Set<string>): boolean {
+		for (const key of baselineKeys) {
+			if (!currentKeys.has(key)) {
+				return true;
+			}
+		}
+		return false;
 	}
 
 	private collectSectionKeysForFiles(elements: DocumentElement[], files: Set<string>): Set<string> {
@@ -364,8 +560,25 @@ class ThesisCheckerController implements vscode.Disposable {
 	}
 
 	private buildElementKey(element: DocumentElement): string {
-		const range = element.range;
-		return `${element.filePath}:${element.type}:${range.start.line}:${range.start.character}-${range.end.line}:${range.end.character}`;
+		const cached = this.elementKeyCache?.get(element);
+		if (cached) {
+			return cached;
+		}
+		const hash = this.hashContent(element.content);
+		return `${element.filePath}:${element.type}:${hash}:0`;
+	}
+
+	private buildElementKeyCache(elements: DocumentElement[]): Map<DocumentElement, string> {
+		const counts = new Map<string, number>();
+		const map = new Map<DocumentElement, string>();
+		for (const element of elements) {
+			const hash = this.hashContent(element.content);
+			const base = `${element.filePath}:${element.type}:${hash}`;
+			const index = counts.get(base) ?? 0;
+			counts.set(base, index + 1);
+			map.set(element, `${base}:${index}`);
+		}
+		return map;
 	}
 
 	private buildElementKeyMap(elements: DocumentElement[]): Map<string, string> {
@@ -391,7 +604,7 @@ class ThesisCheckerController implements vscode.Disposable {
 
 	private filterCachedLlmEntries(
 		cache: DiagnosticsCache | undefined,
-		unchangedKeys: Set<string>,
+		recheckKeys: Set<string>,
 		currentKeys: Set<string>
 	): CachedDiagnostic[] {
 		if (!cache?.diagnostics?.length) {
@@ -401,7 +614,10 @@ class ThesisCheckerController implements vscode.Disposable {
 			if (!entry.elementKey || !entry.source?.startsWith('LLM:')) {
 				return false;
 			}
-			return currentKeys.has(entry.elementKey) && unchangedKeys.has(entry.elementKey);
+			if (!currentKeys.has(entry.elementKey)) {
+				return false;
+			}
+			return !recheckKeys.has(entry.elementKey);
 		});
 	}
 
@@ -447,11 +663,45 @@ class ThesisCheckerController implements vscode.Disposable {
 		});
 	}
 
-	private deserializeDiagnostics(entries: CachedDiagnostic[]): AnalyzerDiagnostic[] {
+	private collectBaselineKeys(cache: DiagnosticsCache | undefined): Set<string> {
+		const keys = new Set<string>();
+		if (!cache) {
+			return keys;
+		}
+		if (Array.isArray(cache.elementKeys)) {
+			for (const key of cache.elementKeys) {
+				keys.add(key);
+			}
+			return keys;
+		}
+		for (const entry of cache.diagnostics ?? []) {
+			if (entry.elementKey) {
+				keys.add(entry.elementKey);
+			}
+		}
+		return keys;
+	}
+
+	private collectRecheckKeys(currentKeys: Set<string>, baselineKeys: Set<string>): Set<string> {
+		const recheck = new Set<string>();
+		for (const key of currentKeys) {
+			if (!baselineKeys.has(key)) {
+				recheck.add(key);
+			}
+		}
+		return recheck;
+	}
+
+	private deserializeDiagnostics(
+		entries: CachedDiagnostic[],
+		elementCache?: Record<string, CachedElement>
+	): AnalyzerDiagnostic[] {
 		return entries.map((entry) => {
+			const cachedElement = entry.elementKey ? elementCache?.[entry.elementKey] : undefined;
+			const rangeSource = cachedElement?.range ?? entry.range;
 			const range = new vscode.Range(
-				new vscode.Position(entry.range.start.line, entry.range.start.character),
-				new vscode.Position(entry.range.end.line, entry.range.end.character)
+				new vscode.Position(rangeSource.start.line, rangeSource.start.character),
+				new vscode.Position(rangeSource.end.line, rangeSource.end.character)
 			);
 			const diagnostic = new vscode.Diagnostic(range, entry.message, entry.severity);
 			if (entry.source) {
@@ -499,6 +749,20 @@ class ThesisCheckerController implements vscode.Disposable {
 		return path.join(folderPath, `${name}.${kind}.json`);
 	}
 
+	private async clearAllCaches(workspaceFolder: vscode.WorkspaceFolder): Promise<void> {
+		const targets: Array<[cache: 'parse' | 'logic' | 'llm', kind: 'current' | 'prev']> = [
+			['parse', 'current'],
+			['parse', 'prev'],
+			['logic', 'current'],
+			['logic', 'prev'],
+			['llm', 'current'],
+			['llm', 'prev']
+		];
+		await Promise.all(
+			targets.map(([name, kind]) => fs.rm(this.getCachePath(workspaceFolder, name, kind), { force: true }))
+		);
+	}
+
 	private async loadParseCache(
 		workspaceFolder: vscode.WorkspaceFolder,
 		kind: 'current' | 'prev'
@@ -506,7 +770,11 @@ class ThesisCheckerController implements vscode.Disposable {
 		const cachePath = this.getCachePath(workspaceFolder, 'parse', kind);
 		try {
 			const content = await fs.readFile(cachePath, 'utf8');
-			return JSON.parse(content) as ParseCache;
+			const parsed = JSON.parse(content) as ParseCache;
+			if (parsed.version !== CACHE_VERSION) {
+				return undefined;
+			}
+			return parsed;
 		} catch {
 			return undefined;
 		}
@@ -534,7 +802,11 @@ class ThesisCheckerController implements vscode.Disposable {
 		const cachePath = this.getCachePath(workspaceFolder, name, kind);
 		try {
 			const content = await fs.readFile(cachePath, 'utf8');
-			return JSON.parse(content) as DiagnosticsCache;
+			const parsed = JSON.parse(content) as DiagnosticsCache;
+			if (parsed.version !== CACHE_VERSION) {
+				return undefined;
+			}
+			return parsed;
 		} catch {
 			return undefined;
 		}
@@ -557,6 +829,20 @@ class ThesisCheckerController implements vscode.Disposable {
 		}
 		await fs.writeFile(cachePath, JSON.stringify(cache, null, 2), 'utf8');
 	}
+
+	private async promoteDiagnosticsCache(
+		workspaceFolder: vscode.WorkspaceFolder,
+		name: 'logic' | 'llm'
+	): Promise<void> {
+		const currentPath = this.getCachePath(workspaceFolder, name, 'current');
+		const prevPath = this.getCachePath(workspaceFolder, name, 'prev');
+		try {
+			await fs.copyFile(currentPath, prevPath);
+		} catch {
+			// Ignore when cache does not exist yet.
+		}
+	}
+
 	public dispose(): void {
 		this.statusBarItem.dispose();
 	}
@@ -571,6 +857,8 @@ interface ElementCacheResult {
 	entries: Record<string, CachedElement>;
 	changedElements: DocumentElement[];
 	unchangedKeys: Set<string>;
+	newKeys: Set<string>;
+	modifiedKeys: Set<string>;
 	removedKeys: Set<string>;
 	removedFiles: Set<string>;
 	removedSentence: boolean;
@@ -605,4 +893,7 @@ interface DiagnosticsCache {
 	version: number;
 	generatedAt: string;
 	diagnostics: CachedDiagnostic[];
+	elementKeys?: string[];
 }
+
+type AnalysisMode = 'full' | 'parse' | 'logic' | 'llm';

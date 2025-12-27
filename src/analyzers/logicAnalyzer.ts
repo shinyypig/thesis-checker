@@ -18,8 +18,7 @@ interface LogicIncrementalPlan {
 }
 
 const SENTENCE_PUNCTUATION_REGEX = /[.!?。？！：:；;]/u;
-const ACRONYM_HINT_MESSAGE =
-    "缩写首次出现，应当给出全称，如 机器学习（Machine Learning, ML）或者 Machine Learning (ML)";
+const ACRONYM_HINT_EXAMPLE = "应当给出全称。";
 const MIN_ACRONYM_LENGTH = 3;
 const ENUMERATED_DEFINITION_HINT = /分别.*?(代表|表示|指|是)/u;
 const SECTION_LEVELS: Record<ElementTypes, number> = {
@@ -182,7 +181,7 @@ export class LogicAnalyzer {
                 if (!definitionsInSentence.has(acronym)) {
                     const diagnostic = new vscode.Diagnostic(
                         element.range,
-                        ACRONYM_HINT_MESSAGE,
+                        `缩写“${acronym}”首次出现，${ACRONYM_HINT_EXAMPLE}`,
                         vscode.DiagnosticSeverity.Warning
                     );
                     diagnostic.source = "Thesis Logic";
@@ -248,7 +247,7 @@ export class LogicAnalyzer {
             }
             const diagnostic = new vscode.Diagnostic(
                 stat.element.range,
-                `章节“${stat.element.content}”仅包含 ${stat.sentences} 个句子（建议至少 ${minSentences} 个）。`,
+                `章节“${stat.element.content}”过于简短，建议丰富内容。`,
                 vscode.DiagnosticSeverity.Warning
             );
             diagnostic.source = "Thesis Logic";
