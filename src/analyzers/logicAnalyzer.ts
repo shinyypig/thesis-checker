@@ -1,177 +1,330 @@
-import * as vscode from 'vscode';
-import { AnalyzerDiagnostic, DocumentElement } from '../types';
+import * as vscode from "vscode";
+import { AnalyzerDiagnostic, DocumentElement } from "../types";
+import { COMMON_ACRONYMS } from "./commonAcronyms";
 
 interface SectionStat {
-	element: DocumentElement;
-	sentences: number;
+    element: DocumentElement;
+    sentences: number;
+    level: number;
+    hasChildSection: boolean;
 }
 
-const SENTENCE_PUNCTUATION_REGEX = /[.!?。？！]$/u;
-const ACRONYM_HINT_MESSAGE = '缩写首次出现，应当给出全称，如 机器学习（Machine Learning, ML）或者 Machine Learning (ML)';
+interface LogicIncrementalPlan {
+    punctuationTargets?: Set<string>;
+    captionTargets?: Set<string>;
+    abbreviationStartIndex?: number;
+    sectionFilesToRecheck?: Set<string>;
+    elementKeyFor: (element: DocumentElement) => string;
+}
+
+const SENTENCE_PUNCTUATION_REGEX = /[.!?。？！：:；;]/u;
+const ACRONYM_HINT_MESSAGE =
+    "缩写首次出现，应当给出全称，如 机器学习（Machine Learning, ML）或者 Machine Learning (ML)";
+const MIN_ACRONYM_LENGTH = 3;
+const ENUMERATED_DEFINITION_HINT = /分别.*?(代表|表示|指|是)/u;
+const SECTION_LEVELS: Record<ElementTypes, number> = {
+    chapter: 0,
+    section: 1,
+    subsection: 2,
+    subsubsection: 3,
+};
 
 export class LogicAnalyzer {
-	private readonly config = vscode.workspace.getConfiguration('thesisChecker');
+    private readonly config =
+        vscode.workspace.getConfiguration("thesisChecker");
 
-	public analyze(elements: DocumentElement[]): AnalyzerDiagnostic[] {
-		const diagnostics: AnalyzerDiagnostic[] = [];
-		diagnostics.push(...this.checkSentencePunctuation(elements));
-		diagnostics.push(...this.checkAbbreviations(elements));
-		diagnostics.push(...this.checkSectionDensity(elements));
-		diagnostics.push(...this.checkCaptions(elements));
-		return diagnostics;
-	}
+    public analyze(elements: DocumentElement[]): AnalyzerDiagnostic[] {
+        const diagnostics: AnalyzerDiagnostic[] = [];
+        diagnostics.push(...this.checkSentencePunctuation(elements));
+        diagnostics.push(...this.checkAbbreviations(elements));
+        diagnostics.push(...this.checkSectionDensity(elements));
+        diagnostics.push(...this.checkCaptions(elements));
+        return diagnostics;
+    }
 
-	private checkSentencePunctuation(elements: DocumentElement[]): AnalyzerDiagnostic[] {
-		const diagnostics: AnalyzerDiagnostic[] = [];
+    public analyzeIncremental(
+        elements: DocumentElement[],
+        plan: LogicIncrementalPlan
+    ): AnalyzerDiagnostic[] {
+        const diagnostics: AnalyzerDiagnostic[] = [];
 
-		for (const element of elements) {
-			if (element.type !== 'sentence') {
-				continue;
-			}
+        if (plan.punctuationTargets?.size) {
+            const targets = elements.filter(
+                (element) =>
+                    element.type === "sentence" &&
+                    plan.punctuationTargets?.has(plan.elementKeyFor(element))
+            );
+            diagnostics.push(...this.checkSentencePunctuation(targets));
+        }
 
-			const value = element.content.trim();
-			if (!value) {
-				continue;
-			}
+        if (plan.abbreviationStartIndex !== undefined) {
+            const sentences = elements.filter(
+                (element) => element.type === "sentence"
+            );
+            const startIndex = Math.max(
+                0,
+                Math.min(plan.abbreviationStartIndex, sentences.length)
+            );
+            diagnostics.push(
+                ...this.checkAbbreviationsFromIndex(sentences, startIndex)
+            );
+        }
 
-			if (!SENTENCE_PUNCTUATION_REGEX.test(value)) {
-				const diagnostic = new vscode.Diagnostic(
-					element.range,
-					'Sentence is missing terminal punctuation.',
-					vscode.DiagnosticSeverity.Warning
-				);
-				diagnostic.source = 'Thesis Logic';
-				diagnostics.push({ uri: vscode.Uri.file(element.filePath), diagnostic });
-			}
-		}
+        if (plan.sectionFilesToRecheck?.size) {
+            const grouped = new Map<string, DocumentElement[]>();
+            for (const element of elements) {
+                if (!plan.sectionFilesToRecheck.has(element.filePath)) {
+                    continue;
+                }
+                const bucket = grouped.get(element.filePath) ?? [];
+                bucket.push(element);
+                grouped.set(element.filePath, bucket);
+            }
+            for (const group of grouped.values()) {
+                diagnostics.push(...this.checkSectionDensity(group));
+            }
+        }
 
-		return diagnostics;
-	}
+        if (plan.captionTargets?.size) {
+            const targets = elements.filter((element) => {
+                if (element.type !== "figure" && element.type !== "table") {
+                    return false;
+                }
+                return plan.captionTargets?.has(plan.elementKeyFor(element));
+            });
+            diagnostics.push(...this.checkCaptions(targets));
+        }
 
-	private checkAbbreviations(elements: DocumentElement[]): AnalyzerDiagnostic[] {
-		const diagnostics: AnalyzerDiagnostic[] = [];
-		const seenAcronyms = new Set<string>();
+        return diagnostics;
+    }
 
-		for (const element of elements) {
-			if (element.type !== 'sentence') {
-				continue;
-			}
+    private checkSentencePunctuation(
+        elements: DocumentElement[]
+    ): AnalyzerDiagnostic[] {
+        const diagnostics: AnalyzerDiagnostic[] = [];
 
-			const definitionsInSentence = this.extractDefinedAcronyms(element.content);
-			const acronyms = this.extractAcronyms(element.content);
+        for (const element of elements) {
+            if (element.type !== "sentence") {
+                continue;
+            }
 
-			for (const acronym of acronyms) {
-				if (seenAcronyms.has(acronym)) {
-					continue;
-				}
-				seenAcronyms.add(acronym);
-				if (!definitionsInSentence.has(acronym)) {
-					const diagnostic = new vscode.Diagnostic(
-						element.range,
-						ACRONYM_HINT_MESSAGE,
-						vscode.DiagnosticSeverity.Warning
-					);
-					diagnostic.source = 'Thesis Logic';
-					diagnostic.code = 'ACRONYM_FIRST_USE';
-					diagnostic.relatedInformation = [
-						new vscode.DiagnosticRelatedInformation(
-							new vscode.Location(vscode.Uri.file(element.filePath), element.range),
-							`缩写：${acronym}`
-						)
-					];
-					diagnostics.push({ uri: vscode.Uri.file(element.filePath), diagnostic });
-				}
-			}
-		}
+            const value = element.content.trim();
+            if (!value) {
+                continue;
+            }
 
-		return diagnostics;
-	}
+            if (!SENTENCE_PUNCTUATION_REGEX.test(value)) {
+                const diagnostic = new vscode.Diagnostic(
+                    element.range,
+                    "句子缺少句末标点。",
+                    vscode.DiagnosticSeverity.Warning
+                );
+                diagnostic.source = "Thesis Logic";
+                diagnostics.push({
+                    uri: vscode.Uri.file(element.filePath),
+                    diagnostic,
+                });
+            }
+        }
 
-	private checkSectionDensity(elements: DocumentElement[]): AnalyzerDiagnostic[] {
-		const diagnostics: AnalyzerDiagnostic[] = [];
-		const stats: SectionStat[] = [];
-		let currentSection: SectionStat | undefined;
-		const sectionTypes = new Set<ElementTypes>(['chapter', 'section', 'subsection', 'subsubsection']);
-		const minSentences = this.config.get<number>('logic.minimumSentencesPerSection', 3);
+        return diagnostics;
+    }
 
-		for (const element of elements) {
-			if (sectionTypes.has(element.type as ElementTypes)) {
-				currentSection = { element, sentences: 0 };
-				stats.push(currentSection);
-				continue;
-			}
-			if (element.type === 'sentence' && currentSection) {
-				currentSection.sentences += 1;
-			}
-		}
+    private checkAbbreviations(
+        elements: DocumentElement[]
+    ): AnalyzerDiagnostic[] {
+        return this.checkAbbreviationsFromIndex(elements, 0);
+    }
 
-		for (const stat of stats) {
-			if (stat.sentences >= minSentences) {
-				continue;
-			}
-			const diagnostic = new vscode.Diagnostic(
-				stat.element.range,
-				`Section "${stat.element.content}" only contains ${stat.sentences} sentences (minimum recommended: ${minSentences}).`,
-				vscode.DiagnosticSeverity.Warning
-			);
-			diagnostic.source = 'Thesis Logic';
-			diagnostics.push({ uri: vscode.Uri.file(stat.element.filePath), diagnostic });
-		}
+    private checkAbbreviationsFromIndex(
+        elements: DocumentElement[],
+        startIndex: number
+    ): AnalyzerDiagnostic[] {
+        const diagnostics: AnalyzerDiagnostic[] = [];
+        const seenAcronyms = new Set<string>();
 
-		return diagnostics;
-	}
+        const start = Math.max(0, Math.min(startIndex, elements.length));
 
-	private checkCaptions(elements: DocumentElement[]): AnalyzerDiagnostic[] {
-		const diagnostics: AnalyzerDiagnostic[] = [];
+        for (let index = 0; index < start; index += 1) {
+            const element = elements[index];
+            if (element.type !== "sentence") {
+                continue;
+            }
+            for (const acronym of this.extractAcronyms(element.content)) {
+                const normalized = acronym.toUpperCase();
+                if (COMMON_ACRONYMS.has(normalized)) {
+                    continue;
+                }
+                seenAcronyms.add(acronym);
+            }
+        }
 
-		for (const element of elements) {
-			if (element.type !== 'figure' && element.type !== 'table') {
-				continue;
-			}
+        for (let index = start; index < elements.length; index += 1) {
+            const element = elements[index];
+            if (element.type !== "sentence") {
+                continue;
+            }
 
-			const hasCaption = Boolean(element.metadata?.hasCaption);
-			if (hasCaption) {
-				continue;
-			}
+            const definitionsInSentence = this.extractDefinedAcronyms(
+                element.content
+            );
+            const acronyms = this.extractAcronyms(element.content);
 
-			const diagnostic = new vscode.Diagnostic(
-				element.range,
-				`${element.type === 'figure' ? 'Figure' : 'Table'} is missing a \\caption{...}.`,
-				vscode.DiagnosticSeverity.Warning
-			);
-			diagnostic.source = 'Thesis Logic';
-			diagnostics.push({ uri: vscode.Uri.file(element.filePath), diagnostic });
-		}
+            for (const acronym of acronyms) {
+                const normalized = acronym.toUpperCase();
+                if (COMMON_ACRONYMS.has(normalized)) {
+                    continue;
+                }
+                if (seenAcronyms.has(acronym)) {
+                    continue;
+                }
+                seenAcronyms.add(acronym);
+                if (!definitionsInSentence.has(acronym)) {
+                    const diagnostic = new vscode.Diagnostic(
+                        element.range,
+                        ACRONYM_HINT_MESSAGE,
+                        vscode.DiagnosticSeverity.Warning
+                    );
+                    diagnostic.source = "Thesis Logic";
+                    diagnostic.code = "ACRONYM_FIRST_USE";
+                    diagnostic.relatedInformation = [
+                        new vscode.DiagnosticRelatedInformation(
+                            new vscode.Location(
+                                vscode.Uri.file(element.filePath),
+                                element.range
+                            ),
+                            `缩写：${acronym}`
+                        ),
+                    ];
+                    diagnostics.push({
+                        uri: vscode.Uri.file(element.filePath),
+                        diagnostic,
+                    });
+                }
+            }
+        }
 
-		return diagnostics;
-	}
+        return diagnostics;
+    }
 
-	private extractAcronyms(text: string): string[] {
-		const matches = text.match(/\b[A-Z]{2,}\b/g);
-		if (!matches) {
-			return [];
-		}
-		return matches;
-	}
+    private checkSectionDensity(
+        elements: DocumentElement[]
+    ): AnalyzerDiagnostic[] {
+        const diagnostics: AnalyzerDiagnostic[] = [];
+        const stats: SectionStat[] = [];
+        const stack: SectionStat[] = [];
+        const minSentences = this.config.get<number>(
+            "logic.minimumSentencesPerSection",
+            3
+        );
 
-	private extractDefinedAcronyms(text: string): Set<string> {
-		const definitions = new Set<string>();
-		const genericParenRegex = /([^\(\)（）]{2,})\s*[\(（]([^\)）]+)[\)）]/g;
-		let match: RegExpExecArray | null;
+        for (const element of elements) {
+            const level = SECTION_LEVELS[element.type as ElementTypes];
+            if (typeof level === "number") {
+                while (stack.length && stack[stack.length - 1].level >= level) {
+                    stack.pop();
+                }
+                const stat: SectionStat = {
+                    element,
+                    sentences: 0,
+                    level,
+                    hasChildSection: false,
+                };
+                if (stack.length) {
+                    stack[stack.length - 1].hasChildSection = true;
+                }
+                stack.push(stat);
+                stats.push(stat);
+                continue;
+            }
+            if (element.type === "sentence" && stack.length) {
+                stack[stack.length - 1].sentences += 1;
+            }
+        }
 
-		while ((match = genericParenRegex.exec(text)) !== null) {
-			const inner = match[2];
-			const uppercaseTokens = inner.match(/\b[A-Z]{2,}\b/g);
-			if (!uppercaseTokens) {
-				continue;
-			}
-			for (const token of uppercaseTokens) {
-				definitions.add(token);
-			}
-		}
+        for (const stat of stats) {
+            if (stat.sentences >= minSentences || stat.hasChildSection) {
+                continue;
+            }
+            const diagnostic = new vscode.Diagnostic(
+                stat.element.range,
+                `章节“${stat.element.content}”仅包含 ${stat.sentences} 个句子（建议至少 ${minSentences} 个）。`,
+                vscode.DiagnosticSeverity.Warning
+            );
+            diagnostic.source = "Thesis Logic";
+            diagnostics.push({
+                uri: vscode.Uri.file(stat.element.filePath),
+                diagnostic,
+            });
+        }
 
-		return definitions;
-	}
+        return diagnostics;
+    }
+
+    private checkCaptions(elements: DocumentElement[]): AnalyzerDiagnostic[] {
+        const diagnostics: AnalyzerDiagnostic[] = [];
+
+        for (const element of elements) {
+            if (element.type !== "figure" && element.type !== "table") {
+                continue;
+            }
+
+            const hasCaption = Boolean(element.metadata?.hasCaption);
+            if (hasCaption) {
+                continue;
+            }
+
+            const diagnostic = new vscode.Diagnostic(
+                element.range,
+                element.type === "figure"
+                    ? "图缺少 \\caption{...}。"
+                    : "表缺少 \\caption{...}。",
+                vscode.DiagnosticSeverity.Warning
+            );
+            diagnostic.source = "Thesis Logic";
+            diagnostics.push({
+                uri: vscode.Uri.file(element.filePath),
+                diagnostic,
+            });
+        }
+
+        return diagnostics;
+    }
+
+    private extractAcronyms(text: string): string[] {
+        const matches = text.match(/\b[A-Z]{2,}\b/g);
+        if (!matches) {
+            return [];
+        }
+        return matches.filter((token) => token.length >= MIN_ACRONYM_LENGTH);
+    }
+
+    private extractDefinedAcronyms(text: string): Set<string> {
+        const definitions = new Set<string>();
+        const genericParenRegex = /([^\(\)（）]{2,})\s*[\(（]([^\)）]+)[\)）]/g;
+        let match: RegExpExecArray | null;
+
+        while ((match = genericParenRegex.exec(text)) !== null) {
+            const inner = match[2];
+            const uppercaseTokens = inner.match(/\b[A-Z]{2,}\b/g);
+            if (!uppercaseTokens) {
+                continue;
+            }
+            for (const token of uppercaseTokens) {
+                if (token.length >= MIN_ACRONYM_LENGTH) {
+                    definitions.add(token);
+                }
+            }
+        }
+
+        if (ENUMERATED_DEFINITION_HINT.test(text)) {
+            for (const token of this.extractAcronyms(text)) {
+                definitions.add(token);
+            }
+        }
+
+        return definitions;
+    }
 }
 
-type ElementTypes = 'chapter' | 'section' | 'subsection' | 'subsubsection';
+type ElementTypes = "chapter" | "section" | "subsection" | "subsubsection";

@@ -10,6 +10,8 @@
     "Other"
   ],
   "activationEvents": [
+    "onStartupFinished",
+    "workspaceContains:**/*.tex",
     "onCommand:thesis-checker.scanWorkspace",
     "onCommand:thesis-checker.exportStructure"
   ],
