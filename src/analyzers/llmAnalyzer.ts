@@ -24,6 +24,13 @@ interface LLMIssue {
 
 interface LLMReview {
     issues: LLMIssue[];
+    rewrite?: string;
+}
+
+interface LLMReviewResult {
+    review: LLMReview | undefined;
+    prompt: string | { system: string; user: string };
+    raw?: string;
 }
 
 function normalizeReviewContent(value: string): string {
@@ -48,6 +55,9 @@ function parseReview(value?: string): LLMReview | undefined {
     try {
         const parsed = JSON.parse(normalized) as LLMReview;
         if (Array.isArray(parsed.issues)) {
+            if (typeof parsed.rewrite !== "string") {
+                delete parsed.rewrite;
+            }
             return parsed;
         }
         return { issues: [] };
@@ -104,6 +114,56 @@ function extractQuotedFragments(
     return undefined;
 }
 
+function isQuotedFragmentMissing(message: string, content: string): boolean {
+    const fragments = extractQuotedFragments(message);
+    if (!fragments) {
+        return false;
+    }
+    return !content.includes(fragments.before);
+}
+
+function isFunctionWordSwap(message: string): boolean {
+    const fragments = extractQuotedFragments(message);
+    if (!fragments || fragments.before === fragments.after) {
+        return false;
+    }
+    const stopWords = new Set([
+        "即",
+        "将",
+        "的",
+        "地",
+        "得",
+        "了",
+        "在",
+        "对",
+        "与",
+        "和",
+        "及",
+    ]);
+    return stopWords.has(fragments.before) && stopWords.has(fragments.after);
+}
+
+function isStopWordSingleReplacement(message: string): boolean {
+    const fragments = extractQuotedFragments(message);
+    if (!fragments || fragments.before === fragments.after) {
+        return false;
+    }
+    const stopWords = new Set([
+        "即",
+        "将",
+        "的",
+        "地",
+        "得",
+        "了",
+        "在",
+        "对",
+        "与",
+        "和",
+        "及",
+    ]);
+    return fragments.before.length === 1 && stopWords.has(fragments.before);
+}
+
 function containsLatinOrLatex(value: string): boolean {
     return /[A-Za-z]/.test(value) || /\\/.test(value);
 }
@@ -152,43 +212,28 @@ function isConcreteIssue(message: string): boolean {
         return false;
     }
     if (
-        fragments.before.length < 2 ||
-        fragments.after.length < 2 ||
-        fragments.before.length > 20 ||
-        fragments.after.length > 20 ||
         containsLatinOrLatex(fragments.before) ||
         containsLatinOrLatex(fragments.after)
     ) {
         return false;
     }
     const typoSignal = /错别字|拼写错误|笔误|错字/.test(trimmed);
+    const repeatSignal = /重复|多余/.test(trimmed);
     const insertionDeletion =
         fragments.before.includes(fragments.after) ||
         fragments.after.includes(fragments.before);
     if (!insertionDeletion) {
-        const maxLen = Math.max(
-            fragments.before.length,
-            fragments.after.length
-        );
         const distance = editDistance(fragments.before, fragments.after);
-        if (
-            !typoSignal ||
-            fragments.before.length < 3 ||
-            fragments.after.length < 3 ||
-            maxLen > 6 ||
-            distance > 1
-        ) {
+        if (!typoSignal || distance > 1) {
+            return false;
+        }
+    } else if (typoSignal) {
+        // Allow minimal insert/delete for clear typo fixes.
+    } else if (repeatSignal) {
+        if (!isExactDuplication(fragments.before, fragments.after)) {
             return false;
         }
     } else {
-        const lengthDiff = Math.abs(
-            fragments.before.length - fragments.after.length
-        );
-        if (lengthDiff > 1 && !isExactDuplication(fragments.before, fragments.after)) {
-            return false;
-        }
-    }
-    if (trimmed.length > 140) {
         return false;
     }
     return true;
@@ -202,13 +247,22 @@ function hasRecognizedSeverity(issue: LLMIssue): boolean {
 interface LLMProvider {
     readonly id: string;
     isConfigured(): boolean;
-    review(element: DocumentElement): Promise<LLMReview | undefined>;
+    review(element: DocumentElement): Promise<LLMReviewResult | undefined>;
 }
 
 interface LLMAnalysisOptions {
     progress?: vscode.Progress<{ message?: string; increment?: number }>;
     token?: vscode.CancellationToken;
     onDiagnostics?: (items: AnalyzerDiagnostic[], element: DocumentElement) => void;
+    onDebug?: (
+        result: {
+            prompt: LLMReviewResult["prompt"];
+            response?: string;
+            review?: LLMReview;
+            providerId: string;
+        },
+        element: DocumentElement
+    ) => void;
 }
 
 export class LLMAnalyzer {
@@ -256,16 +310,35 @@ export class LLMAnalyzer {
             if (token?.isCancellationRequested) {
                 break;
             }
-            const review = await provider.review(element);
+            const result = await provider.review(element);
             processed += 1;
             progress?.report({
                 message: `LLM analyzing ${processed}/${targets.length}`,
                 increment,
             });
+            if (!result) {
+                continue;
+            }
+            if (options?.onDebug) {
+                options.onDebug(
+                    {
+                        prompt: result.prompt,
+                        response: result.raw,
+                        review: result.review,
+                        providerId: provider.id,
+                    },
+                    element
+                );
+            }
+            const review = result.review;
             if (!review) {
                 continue;
             }
             const newDiagnostics: AnalyzerDiagnostic[] = [];
+            const rewrite =
+                typeof review.rewrite === "string"
+                    ? review.rewrite.trim()
+                    : "";
             for (const issue of review.issues) {
                 if (
                     !issue.message ||
@@ -274,14 +347,23 @@ export class LLMAnalyzer {
                     isLowValueIssue(issue.message) ||
                     isStyleIssue(issue.message) ||
                     isJsonLikeIssue(issue.message) ||
+                    isQuotedFragmentMissing(issue.message, element.content) ||
+                    isFunctionWordSwap(issue.message) ||
+                    isStopWordSingleReplacement(issue.message) ||
                     !isConcreteIssue(issue.message)
                 ) {
                     continue;
                 }
+                if (!rewrite) {
+                    continue;
+                }
                 const severity = this.mapSeverity(issue.severity);
+                const message = rewrite
+                    ? `[LLM] ${issue.message} 修改后：${rewrite}`
+                    : `[LLM] ${issue.message}`;
                 const diagnostic = new vscode.Diagnostic(
                     element.range,
-                    `[LLM] ${issue.message}`,
+                    message,
                     severity
                 );
                 diagnostic.source = `LLM:${provider.id}`;
@@ -339,15 +421,18 @@ class OpenAIProvider implements LLMProvider {
 
     public async review(
         element: DocumentElement
-    ): Promise<LLMReview | undefined> {
+    ): Promise<LLMReviewResult | undefined> {
         const url =
             this.settings.openaiBaseUrl?.trim() ||
             "https://api.openai.com/v1/chat/completions";
+        const normalizedUrl = this.normalizeUrl(url);
         const apiKey = this.settings.openaiApiKey?.trim();
         if (!apiKey) {
             return undefined;
         }
 
+        const system = LLM_REVIEW_SYSTEM_PROMPT;
+        const user = buildLlmReviewUserPrompt(element.content);
         const payload = {
             model: this.settings.openaiModel || "gpt-3.5-turbo",
             temperature: 0,
@@ -355,22 +440,32 @@ class OpenAIProvider implements LLMProvider {
             messages: [
                 {
                     role: "system",
-                    content: LLM_REVIEW_SYSTEM_PROMPT,
+                    content: system,
                 },
                 {
                     role: "user",
-                    content: buildLlmReviewUserPrompt(element.content),
+                    content: user,
                 },
             ],
         };
 
         try {
-            const response = await fetch(url, {
+            const headers: Record<string, string> = {
+                Authorization: `Bearer ${apiKey}`,
+                "Content-Type": "application/json",
+            };
+            const isOpenRouter = normalizedUrl.includes("openrouter.ai");
+            const referer = isOpenRouter ? "https://localhost" : "";
+            if (referer) {
+                headers["HTTP-Referer"] = referer;
+            }
+            const title = isOpenRouter ? "thesis-checker" : "";
+            if (title) {
+                headers["X-Title"] = title;
+            }
+            const response = await fetch(normalizedUrl, {
                 method: "POST",
-                headers: {
-                    Authorization: `Bearer ${apiKey}`,
-                    "Content-Type": "application/json",
-                },
+                headers,
                 body: JSON.stringify(payload),
             });
 
@@ -385,10 +480,32 @@ class OpenAIProvider implements LLMProvider {
             const data = await response.json();
             const content: string | undefined =
                 data.choices?.[0]?.message?.content;
-            return parseReview(content);
+            return {
+                review: parseReview(content),
+                prompt: { system, user },
+                raw: content,
+            };
         } catch (error) {
             this.output.appendLine(`OpenAI request failed: ${String(error)}`);
             return undefined;
+        }
+    }
+
+    private normalizeUrl(url: string): string {
+        try {
+            const parsed = new URL(url);
+            if (parsed.hostname.includes("openrouter.ai")) {
+                if (parsed.pathname === "/v1") {
+                    parsed.pathname = "/api/v1";
+                } else if (parsed.pathname === "/v1/") {
+                    parsed.pathname = "/api/v1/";
+                } else if (parsed.pathname.startsWith("/v1/")) {
+                    parsed.pathname = `/api${parsed.pathname}`;
+                }
+            }
+            return parsed.toString();
+        } catch {
+            return url;
         }
     }
 }
@@ -407,14 +524,15 @@ class OllamaProvider implements LLMProvider {
 
     public async review(
         element: DocumentElement
-    ): Promise<LLMReview | undefined> {
+    ): Promise<LLMReviewResult | undefined> {
         const endpoint = (
             this.settings.ollamaEndpoint || "http://localhost:11434"
         ).replace(/\/$/, "");
         const model = this.settings.ollamaModel || "llama3";
+        const prompt = this.buildPrompt(element);
         const payload = {
             model,
-            prompt: this.buildPrompt(element),
+            prompt,
             stream: false,
             options: {
                 temperature: 0,
@@ -437,7 +555,11 @@ class OllamaProvider implements LLMProvider {
                 return undefined;
             }
             const data = await response.json();
-            return parseReview(data.response);
+            return {
+                review: parseReview(data.response),
+                prompt,
+                raw: data.response,
+            };
         } catch (error) {
             this.output.appendLine(`Ollama request failed: ${String(error)}`);
             return undefined;

@@ -24,16 +24,12 @@
   "contributes": {
     "commands": [
       {
-        "command": "thesis-checker.scanWorkspace",
-        "title": "Thesis Checker: Scan Workspace"
-      },
-      {
         "command": "thesis-checker.parseWorkspace",
         "title": "Thesis Checker: Parse Workspace"
       },
       {
         "command": "thesis-checker.parseWorkspaceRescan",
-        "title": "Thesis Checker: Parse Workspace (Rescan & Clear Cache)"
+        "title": "Thesis Checker: Reparse Workspace"
       },
       {
         "command": "thesis-checker.runLogicAnalyzer",
@@ -42,10 +38,6 @@
       {
         "command": "thesis-checker.runLlmAnalyzer",
         "title": "Thesis Checker: Run LLM Analyzer"
-      },
-      {
-        "command": "thesis-checker.rescanWorkspace",
-        "title": "Thesis Checker: Rescan Workspace (Ignore Cache)"
       },
       {
         "command": "thesis-checker.exportStructure",
