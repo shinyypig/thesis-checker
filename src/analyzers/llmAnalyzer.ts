@@ -35,16 +35,212 @@ interface LLMReviewResult {
 
 function normalizeReviewContent(value: string): string {
     const trimmed = value.trim();
-    const fenceMatch = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
+    const fenceMatch = trimmed.match(/```(?:[A-Za-z0-9_-]+)?\s*([\s\S]*?)```/i);
     if (fenceMatch?.[1]) {
         return fenceMatch[1].trim();
     }
-    const start = trimmed.indexOf("{");
-    const end = trimmed.lastIndexOf("}");
-    if (start >= 0 && end > start) {
-        return trimmed.slice(start, end + 1).trim();
+    return trimmed;
+}
+
+function normalizeReviewKey(raw: string): string {
+    return raw
+        .trim()
+        .toLowerCase()
+        .replace(/[^\w]+/g, "_")
+        .replace(/^_+|_+$/g, "");
+}
+
+function normalizeSeverityLabel(value?: string): string | undefined {
+    if (!value) {
+        return undefined;
+    }
+    const normalized = value.trim().toLowerCase();
+    if (normalized === "error" || normalized === "warning") {
+        return normalized;
+    }
+    if (/error|err|严重|错误/.test(normalized)) {
+        return "error";
+    }
+    if (/warning|warn|轻微|警告/.test(normalized)) {
+        return "warning";
+    }
+    return undefined;
+}
+
+function stripWrappingQuotes(value?: string): string {
+    if (!value) {
+        return "";
+    }
+    const trimmed = value.trim();
+    if (
+        (trimmed.startsWith('"') && trimmed.endsWith('"')) ||
+        (trimmed.startsWith("'") && trimmed.endsWith("'")) ||
+        (trimmed.startsWith("“") && trimmed.endsWith("”"))
+    ) {
+        return trimmed.slice(1, -1).trim();
     }
     return trimmed;
+}
+
+function parseInteger(value?: string): number | undefined {
+    if (!value) {
+        return undefined;
+    }
+    const match = value.match(/-?\d+/);
+    if (!match) {
+        return undefined;
+    }
+    const parsed = Number.parseInt(match[0], 10);
+    return Number.isNaN(parsed) ? undefined : parsed;
+}
+
+function parseKeyValueLines(value: string): Map<string, string> {
+    const pairs = new Map<string, string>();
+    const lines = value.split(/\r?\n/);
+    for (const rawLine of lines) {
+        const line = rawLine
+            .replace(/^[\s]*(?:[-*•]+|\d+[.)、])\s*/, "")
+            .replace(/＝/g, "=")
+            .trim();
+        if (!line) {
+            continue;
+        }
+        const delimiterIndex = line.indexOf("=");
+        if (delimiterIndex <= 0) {
+            continue;
+        }
+        const key = normalizeReviewKey(line.slice(0, delimiterIndex));
+        if (!key) {
+            continue;
+        }
+        const valuePart = line.slice(delimiterIndex + 1);
+        pairs.set(key, stripWrappingQuotes(valuePart));
+    }
+    return pairs;
+}
+
+function getFirstMatch(
+    pairs: Map<string, string>,
+    aliases: string[]
+): string | undefined {
+    for (const alias of aliases) {
+        const value = pairs.get(alias);
+        if (value !== undefined) {
+            return value;
+        }
+    }
+    return undefined;
+}
+
+function parseCombinedIssueValue(value: string): LLMIssue | undefined {
+    const trimmed = stripWrappingQuotes(value);
+    if (!trimmed) {
+        return undefined;
+    }
+
+    const pipeParts = trimmed
+        .split(/[|｜]/)
+        .map((part) => part.trim())
+        .filter((part) => part.length > 0);
+    if (pipeParts.length >= 2) {
+        const severity = normalizeSeverityLabel(pipeParts[0]);
+        const message = pipeParts.slice(1).join("|").trim();
+        return message ? { message, severity } : undefined;
+    }
+
+    const levelAndMessage = trimmed.match(
+        /^(error|warning|err|warn|错误|警告|严重|轻微)\s*[:：]\s*(.+)$/i
+    );
+    if (levelAndMessage?.[2]) {
+        return {
+            message: levelAndMessage[2].trim(),
+            severity: normalizeSeverityLabel(levelAndMessage[1]),
+        };
+    }
+
+    return { message: trimmed };
+}
+
+function parseIndexedIssue(
+    pairs: Map<string, string>,
+    index: number
+): LLMIssue | undefined {
+    const messageAliases = [
+        `issue${index}_message`,
+        `issue_${index}_message`,
+        `message${index}`,
+        `message_${index}`,
+    ];
+    const severityAliases = [
+        `issue${index}_severity`,
+        `issue_${index}_severity`,
+        `severity${index}`,
+        `severity_${index}`,
+    ];
+    const combinedAliases = [`issue${index}`, `issue_${index}`];
+
+    const message = getFirstMatch(pairs, messageAliases);
+    if (message) {
+        return {
+            message,
+            severity: normalizeSeverityLabel(
+                getFirstMatch(pairs, severityAliases)
+            ),
+        };
+    }
+    const combined = getFirstMatch(pairs, combinedAliases);
+    if (combined) {
+        return parseCombinedIssueValue(combined);
+    }
+    return undefined;
+}
+
+function parseKeyValueReview(value: string): LLMReview | undefined {
+    const pairs = parseKeyValueLines(value);
+    if (pairs.size === 0) {
+        return undefined;
+    }
+
+    const issueCount = parseInteger(
+        getFirstMatch(pairs, ["issue_count", "issues", "issuecount"])
+    );
+    if (issueCount === 0) {
+        return { issues: [] };
+    }
+
+    const issues: LLMIssue[] = [];
+    for (let index = 1; index <= 2; index += 1) {
+        const issue = parseIndexedIssue(pairs, index);
+        if (issue?.message) {
+            issues.push(issue);
+        }
+    }
+
+    if (issues.length === 0) {
+        const singleMessage = getFirstMatch(pairs, ["issue_message", "message"]);
+        if (singleMessage) {
+            issues.push({
+                message: singleMessage,
+                severity: normalizeSeverityLabel(
+                    getFirstMatch(pairs, ["issue_severity", "severity"])
+                ),
+            });
+        }
+    }
+
+    const limitedIssues =
+        issueCount && issueCount > 0 ? issues.slice(0, issueCount) : issues;
+    const rewrite = stripWrappingQuotes(getFirstMatch(pairs, ["rewrite"]));
+
+    if (limitedIssues.length === 0) {
+        return { issues: [] };
+    }
+
+    const result: LLMReview = { issues: limitedIssues };
+    if (rewrite) {
+        result.rewrite = rewrite;
+    }
+    return result;
 }
 
 function parseReview(value?: string): LLMReview | undefined {
@@ -52,18 +248,7 @@ function parseReview(value?: string): LLMReview | undefined {
         return undefined;
     }
     const normalized = normalizeReviewContent(value);
-    try {
-        const parsed = JSON.parse(normalized) as LLMReview;
-        if (Array.isArray(parsed.issues)) {
-            if (typeof parsed.rewrite !== "string") {
-                delete parsed.rewrite;
-            }
-            return parsed;
-        }
-        return { issues: [] };
-    } catch {
-        return { issues: [] };
-    }
+    return parseKeyValueReview(normalized) ?? { issues: [] };
 }
 
 function isPunctuationIssue(message: string): boolean {
@@ -85,11 +270,9 @@ function isStyleIssue(message: string): boolean {
     );
 }
 
-function isJsonLikeIssue(message: string): boolean {
+function isKeyValueLikeIssue(message: string): boolean {
     const trimmed = message.trim();
-    return (
-        trimmed.startsWith("{") && /"issues"\s*:/.test(trimmed)
-    );
+    return /^[A-Za-z][\w-]*\s*=/.test(trimmed);
 }
 
 function hasExplicitReplacement(message: string): boolean {
@@ -346,7 +529,7 @@ export class LLMAnalyzer {
                     isPunctuationIssue(issue.message) ||
                     isLowValueIssue(issue.message) ||
                     isStyleIssue(issue.message) ||
-                    isJsonLikeIssue(issue.message) ||
+                    isKeyValueLikeIssue(issue.message) ||
                     isQuotedFragmentMissing(issue.message, element.content) ||
                     isFunctionWordSwap(issue.message) ||
                     isStopWordSingleReplacement(issue.message) ||
