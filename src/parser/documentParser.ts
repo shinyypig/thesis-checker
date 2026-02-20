@@ -49,7 +49,7 @@ export class DocumentParser {
         return elements;
     }
 
-    private parseDocument(document: vscode.TextDocument): DocumentElement[] {
+    public parseDocument(document: vscode.TextDocument): DocumentElement[] {
         const elements: DocumentElement[] = [];
         const lines = document.getText().split(/\r?\n/);
         const filePath = document.uri.fsPath;

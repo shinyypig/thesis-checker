@@ -3,12 +3,15 @@ import { AnalyzerDiagnostic, DocumentElement } from "../types";
 import {
     buildLlmReviewPrompt,
     buildLlmReviewUserPrompt,
-    LLM_REVIEW_SYSTEM_PROMPT,
+    getLlmReviewSystemPrompt,
+    LLMReviewMode,
+    normalizeLlmReviewMode,
 } from "./llmPrompts";
 
 interface LLMSettings {
     enabled?: boolean;
     provider?: "openai" | "ollama";
+    reviewMode?: LLMReviewMode;
     openaiModel?: string;
     openaiApiKey?: string;
     openaiBaseUrl?: string;
@@ -410,7 +413,32 @@ function isAllowedIssueType(message: string): boolean {
     );
 }
 
-function isConcreteIssue(message: string): boolean {
+function editDistance(a: string, b: string): number {
+    const rows = a.length + 1;
+    const cols = b.length + 1;
+    const dp: number[][] = Array.from({ length: rows }, () =>
+        new Array(cols).fill(0)
+    );
+    for (let row = 0; row < rows; row += 1) {
+        dp[row][0] = row;
+    }
+    for (let col = 0; col < cols; col += 1) {
+        dp[0][col] = col;
+    }
+    for (let row = 1; row < rows; row += 1) {
+        for (let col = 1; col < cols; col += 1) {
+            const replaceCost = a[row - 1] === b[col - 1] ? 0 : 1;
+            dp[row][col] = Math.min(
+                dp[row - 1][col] + 1,
+                dp[row][col - 1] + 1,
+                dp[row - 1][col - 1] + replaceCost
+            );
+        }
+    }
+    return dp[rows - 1][cols - 1];
+}
+
+function isConcreteIssue(message: string, mode: LLMReviewMode): boolean {
     const trimmed = message.trim();
     const weakSignal =
         /建议|可能|不够清晰|不明确|歧义|更通顺|更清晰|更准确|更正式|建议补充|建议说明|建议明确|建议修改为|建议改为|建议将|可能需要/.test(
@@ -436,6 +464,7 @@ function isConcreteIssue(message: string): boolean {
         return false;
     }
 
+    const isLowFalsePositive = mode === "lowFalsePositive";
     const isTypos = /错别字|拼写错误|笔误|错字/.test(trimmed);
     const isRepeatOrRedundant = /重复|多余/.test(trimmed);
 
@@ -452,26 +481,85 @@ function isConcreteIssue(message: string): boolean {
         ) {
             return false;
         }
-        // Keep precision high: only accept "missing-character" fixes,
-        // i.e. corrected fragment must contain the original fragment.
-        if (!fragments.after.includes(fragments.before)) {
+
+        if (isLowFalsePositive) {
+            // Keep precision high: only accept "missing-character" fixes,
+            // i.e. corrected fragment must contain the original fragment.
+            if (!fragments.after.includes(fragments.before)) {
+                return false;
+            }
+            const delta = extractDifferenceSegment(
+                fragments.after,
+                fragments.before
+            );
+            if (!delta) {
+                return false;
+            }
+            const deltaChars = [...delta];
+            if (deltaChars.length !== 1) {
+                return false;
+            }
+            if (
+                deltaChars.some((char) => !/[\p{Letter}\p{Number}]/u.test(char))
+            ) {
+                return false;
+            }
+            if (deltaChars.every((char) => FUNCTION_WORDS.has(char))) {
+                return false;
+            }
+            return true;
+        }
+
+        const insertionDeletion =
+            fragments.before.includes(fragments.after) ||
+            fragments.after.includes(fragments.before);
+        if (insertionDeletion) {
+            const longer =
+                fragments.before.length >= fragments.after.length
+                    ? fragments.before
+                    : fragments.after;
+            const shorter =
+                longer === fragments.before
+                    ? fragments.after
+                    : fragments.before;
+            const delta = extractDifferenceSegment(longer, shorter);
+            if (!delta) {
+                return false;
+            }
+            const deltaChars = [...delta];
+            if (deltaChars.length !== 1) {
+                return false;
+            }
+            if (
+                deltaChars.some((char) => !/[\p{Letter}\p{Number}]/u.test(char))
+            ) {
+                return false;
+            }
+            if (deltaChars.every((char) => FUNCTION_WORDS.has(char))) {
+                return false;
+            }
+            return true;
+        }
+
+        if (editDistance(fragments.before, fragments.after) !== 1) {
             return false;
         }
-        const delta = extractDifferenceSegment(
-            fragments.after,
-            fragments.before
-        );
-        if (!delta) {
+        const beforeChars = [...fragments.before];
+        const afterChars = [...fragments.after];
+        if (beforeChars.length !== afterChars.length) {
             return false;
         }
-        const deltaChars = [...delta];
-        if (deltaChars.length !== 1) {
+        const mismatchPairs = beforeChars
+            .map((char, index) => ({ before: char, after: afterChars[index] }))
+            .filter((pair) => pair.before !== pair.after);
+        if (mismatchPairs.length !== 1) {
             return false;
         }
-        if (deltaChars.some((char) => !/[\p{Letter}\p{Number}]/u.test(char))) {
-            return false;
-        }
-        if (deltaChars.every((char) => FUNCTION_WORDS.has(char))) {
+        const [pair] = mismatchPairs;
+        if (
+            FUNCTION_WORDS.has(pair.before) &&
+            FUNCTION_WORDS.has(pair.after)
+        ) {
             return false;
         }
         return true;
@@ -513,8 +601,6 @@ interface LLMAnalysisOptions {
 }
 
 export class LLMAnalyzer {
-    private readonly configuration =
-        vscode.workspace.getConfiguration("thesisChecker");
     private readonly output: vscode.OutputChannel;
 
     constructor(channel?: vscode.OutputChannel) {
@@ -526,12 +612,15 @@ export class LLMAnalyzer {
         elements: DocumentElement[],
         options?: LLMAnalysisOptions
     ): Promise<AnalyzerDiagnostic[]> {
-        const settings = this.configuration.get<LLMSettings>("llm");
+        const settings = vscode.workspace
+            .getConfiguration("thesisChecker")
+            .get<LLMSettings>("llm");
         if (!settings?.enabled) {
             return [];
         }
 
-        const provider = this.createProvider(settings);
+        const reviewMode = normalizeLlmReviewMode(settings.reviewMode);
+        const provider = this.createProvider(settings, reviewMode);
         if (!provider || !provider.isConfigured()) {
             this.output.appendLine(
                 "LLM provider not configured. Skipping LLM analysis."
@@ -611,13 +700,14 @@ export class LLMAnalyzer {
                     isStyleIssue(issue.message) ||
                     isKeyValueLikeIssue(issue.message) ||
                     isQuotedFragmentMissing(issue.message, element.content) ||
-                    isCorrectedFragmentAlreadyPresent(
-                        issue.message,
-                        element.content
-                    ) ||
+                    (reviewMode === "lowFalsePositive" &&
+                        isCorrectedFragmentAlreadyPresent(
+                            issue.message,
+                            element.content
+                        )) ||
                     isFunctionWordSwap(issue.message) ||
                     isStopWordSingleReplacement(issue.message) ||
-                    !isConcreteIssue(issue.message)
+                    !isConcreteIssue(issue.message, reviewMode)
                 ) {
                     continue;
                 }
@@ -649,13 +739,16 @@ export class LLMAnalyzer {
         return diagnostics;
     }
 
-    private createProvider(settings: LLMSettings): LLMProvider | undefined {
+    private createProvider(
+        settings: LLMSettings,
+        reviewMode: LLMReviewMode
+    ): LLMProvider | undefined {
         switch (settings.provider) {
             case "ollama":
-                return new OllamaProvider(settings, this.output);
+                return new OllamaProvider(settings, this.output, reviewMode);
             case "openai":
             default:
-                return new OpenAIProvider(settings, this.output);
+                return new OpenAIProvider(settings, this.output, reviewMode);
         }
     }
 
@@ -680,7 +773,8 @@ class OpenAIProvider implements LLMProvider {
 
     constructor(
         private readonly settings: LLMSettings,
-        private readonly output: vscode.OutputChannel
+        private readonly output: vscode.OutputChannel,
+        private readonly reviewMode: LLMReviewMode
     ) {}
 
     public isConfigured(): boolean {
@@ -699,8 +793,8 @@ class OpenAIProvider implements LLMProvider {
             return undefined;
         }
 
-        const system = LLM_REVIEW_SYSTEM_PROMPT;
-        const user = buildLlmReviewUserPrompt(element.content);
+        const system = getLlmReviewSystemPrompt(this.reviewMode);
+        const user = buildLlmReviewUserPrompt(element.content, this.reviewMode);
         const payload = {
             model: this.settings.openaiModel || "gpt-3.5-turbo",
             temperature: 0,
@@ -803,7 +897,8 @@ class OllamaProvider implements LLMProvider {
 
     constructor(
         private readonly settings: LLMSettings,
-        private readonly output: vscode.OutputChannel
+        private readonly output: vscode.OutputChannel,
+        private readonly reviewMode: LLMReviewMode
     ) {}
 
     public isConfigured(): boolean {
@@ -858,7 +953,7 @@ class OllamaProvider implements LLMProvider {
     }
 
     private buildPrompt(element: DocumentElement): string {
-        return buildLlmReviewPrompt(element.content);
+        return buildLlmReviewPrompt(element.content, this.reviewMode);
     }
 
 }

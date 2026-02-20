@@ -53,6 +53,17 @@
           "minimum": 0,
           "markdownDescription": "Minimum recommended sentence count per section before raising a warning."
         },
+        "thesisChecker.autoAnalyzeOnSave.enabled": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Automatically run parser + logic + LLM analysis when a .tex file is saved."
+        },
+        "thesisChecker.autoAnalyzeOnSave.debounceMs": {
+          "type": "number",
+          "default": 800,
+          "minimum": 0,
+          "markdownDescription": "Debounce delay in milliseconds before triggering auto analysis after save."
+        },
         "thesisChecker.llm.enabled": {
           "type": "boolean",
           "default": false,
@@ -66,6 +77,15 @@
           ],
           "default": "openai",
           "markdownDescription": "LLM provider to use for AI-based review."
+        },
+        "thesisChecker.llm.reviewMode": {
+          "type": "string",
+          "enum": [
+            "lowFalsePositive",
+            "highRecall"
+          ],
+          "default": "lowFalsePositive",
+          "markdownDescription": "Review profile for LLM analysis: lowFalsePositive is stricter with fewer false alarms; highRecall is looser and reports more potential issues."
         },
         "thesisChecker.llm.openaiApiKey": {
           "type": "string",

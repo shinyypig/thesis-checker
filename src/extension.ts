@@ -42,6 +42,12 @@ export function activate(context: vscode.ExtensionContext) {
             controller.exportStructure()
         )
     );
+
+    context.subscriptions.push(
+        vscode.workspace.onDidSaveTextDocument((document) =>
+            controller.handleDocumentSaved(document)
+        )
+    );
 }
 
 export function deactivate() {
@@ -58,6 +64,10 @@ class ThesisCheckerController implements vscode.Disposable {
     );
     private latestElements: DocumentElement[] = [];
     private elementKeyCache: Map<DocumentElement, string> | null = null;
+    private autoAnalyzeTimer: NodeJS.Timeout | undefined;
+    private analysisInProgress = false;
+    private pendingAutoAnalyze = false;
+    private pendingAutoAnalyzeUri: vscode.Uri | undefined;
 
     constructor(
         private readonly diagnosticCollection: vscode.DiagnosticCollection
@@ -91,10 +101,43 @@ class ThesisCheckerController implements vscode.Disposable {
         this.publishDiagnostics(diagnostics);
     }
 
-    public async runFullAnalysis(options?: {
-        force?: boolean;
-        mode?: AnalysisMode;
-    }): Promise<void> {
+    public handleDocumentSaved(document: vscode.TextDocument): void {
+        if (!this.shouldAutoAnalyzeOnSave(document)) {
+            return;
+        }
+        const debounceMs = this.getAutoAnalyzeDebounceMs();
+        if (this.autoAnalyzeTimer) {
+            clearTimeout(this.autoAnalyzeTimer);
+        }
+        this.autoAnalyzeTimer = setTimeout(() => {
+            this.autoAnalyzeTimer = undefined;
+            if (!this.isAutoAnalyzeOnSaveEnabled()) {
+                return;
+            }
+            void this.runFullAnalysis({
+                mode: "full",
+                trigger: "autoSave",
+                changedDocumentUri: document.uri,
+            });
+        }, debounceMs);
+    }
+
+    public async runFullAnalysis(
+        options?: RunFullAnalysisOptions
+    ): Promise<void> {
+        const trigger = options?.trigger ?? "manual";
+        if (this.analysisInProgress) {
+            if (trigger === "autoSave") {
+                this.pendingAutoAnalyze = true;
+                this.pendingAutoAnalyzeUri = options?.changedDocumentUri;
+                return;
+            }
+            void vscode.window.showInformationMessage(
+                "Thesis Checker analysis is already running."
+            );
+            return;
+        }
+
         if (!vscode.workspace.workspaceFolders?.length) {
             vscode.window.showWarningMessage(
                 "Open a workspace before running Thesis Checker."
@@ -102,6 +145,7 @@ class ThesisCheckerController implements vscode.Disposable {
             return;
         }
 
+        this.analysisInProgress = true;
         try {
             const force = Boolean(options?.force);
             const mode = options?.mode ?? "full";
@@ -114,24 +158,15 @@ class ThesisCheckerController implements vscode.Disposable {
             }
             await vscode.window.withProgress(
                 {
-                    location: vscode.ProgressLocation.Notification,
+                    location:
+                        trigger === "autoSave"
+                            ? vscode.ProgressLocation.Window
+                            : vscode.ProgressLocation.Notification,
                     title: "Thesis Checker",
                     cancellable: false,
                 },
                 async (progress) => {
                     progress.report({ message: "Parsing LaTeX files..." });
-                    const elements = await this.parser.parseWorkspace();
-                    this.latestElements = elements;
-                    this.elementKeyCache = this.buildElementKeyCache(elements);
-
-                    if (elements.length === 0) {
-                        this.diagnosticCollection.clear();
-                        vscode.window.showInformationMessage(
-                            "No .tex files found in the workspace."
-                        );
-                        return;
-                    }
-
                     const workspaceFolder =
                         vscode.workspace.workspaceFolders?.[0];
                     if (workspaceFolder && force) {
@@ -144,6 +179,23 @@ class ThesisCheckerController implements vscode.Disposable {
                                   "current"
                               )
                             : undefined;
+                    const elements = await this.parseElements({
+                        workspaceFolder,
+                        parseCache,
+                        force,
+                        trigger,
+                        changedDocumentUri: options?.changedDocumentUri,
+                    });
+                    this.latestElements = elements;
+                    this.elementKeyCache = this.buildElementKeyCache(elements);
+
+                    if (elements.length === 0) {
+                        this.diagnosticCollection.clear();
+                        vscode.window.showInformationMessage(
+                            "No .tex files found in the workspace."
+                        );
+                        return;
+                    }
                     const elementCache = this.buildElementCache(
                         elements,
                         parseCache
@@ -188,14 +240,20 @@ class ThesisCheckerController implements vscode.Disposable {
                             );
                         }
                     }
+                    const llmConfigSignature = this.getLlmConfigSignature();
                     const parseCacheAvailable = Boolean(parseCache?.elements);
                     const logicBaselineKeys =
                         this.collectBaselineKeys(logicCache);
                     const llmBaselineKeys = this.collectBaselineKeys(llmCache);
                     const logicCacheAvailable =
                         !force && logicBaselineKeys.size > 0;
+                    const llmCacheMatchesSettings =
+                        !runLlm ||
+                        llmCache?.llmConfigSignature === llmConfigSignature;
                     const llmCacheAvailable =
-                        !force && llmBaselineKeys.size > 0;
+                        !force &&
+                        llmBaselineKeys.size > 0 &&
+                        llmCacheMatchesSettings;
                     const incrementalSummary = parseCacheAvailable
                         ? this.formatIncrementalSummary(elementCache)
                         : undefined;
@@ -394,6 +452,7 @@ class ThesisCheckerController implements vscode.Disposable {
                                 ...snapshotDiagnostics,
                             ],
                             elementKeys: [...currentSentenceKeys],
+                            llmConfigSignature,
                         };
                         llmSnapshotWrite = llmSnapshotWrite
                             .then(() =>
@@ -504,6 +563,7 @@ class ThesisCheckerController implements vscode.Disposable {
                                         ),
                                     ],
                                     elementKeys: [...currentSentenceKeys],
+                                    llmConfigSignature,
                                 }
                             );
                         }
@@ -521,7 +581,11 @@ class ThesisCheckerController implements vscode.Disposable {
                             ? this.formatAnalyzedSummary(llmAnalyzedCount)
                             : incrementalSummary;
                     const suffix = summary ? ` ${summary}.` : "";
-                    vscode.window.showInformationMessage(`${message}${suffix}`);
+                    if (trigger !== "autoSave") {
+                        vscode.window.showInformationMessage(
+                            `${message}${suffix}`
+                        );
+                    }
                 }
             );
         } catch (error) {
@@ -529,6 +593,18 @@ class ThesisCheckerController implements vscode.Disposable {
                 `Thesis Checker failed: ${String(error)}`
             );
             console.error(error);
+        } finally {
+            this.analysisInProgress = false;
+            if (this.pendingAutoAnalyze) {
+                this.pendingAutoAnalyze = false;
+                const pendingUri = this.pendingAutoAnalyzeUri;
+                this.pendingAutoAnalyzeUri = undefined;
+                void this.runFullAnalysis({
+                    mode: "full",
+                    trigger: "autoSave",
+                    changedDocumentUri: pendingUri,
+                });
+            }
         }
     }
 
@@ -832,6 +908,160 @@ class ThesisCheckerController implements vscode.Disposable {
         return String(hash >>> 0);
     }
 
+    private async parseElements(
+        options: ParseElementsOptions
+    ): Promise<DocumentElement[]> {
+        const {
+            workspaceFolder,
+            parseCache,
+            force,
+            trigger,
+            changedDocumentUri,
+        } = options;
+        if (
+            trigger !== "autoSave" ||
+            force ||
+            !workspaceFolder ||
+            !parseCache?.elements ||
+            !changedDocumentUri
+        ) {
+            return this.parser.parseWorkspace();
+        }
+        if (
+            changedDocumentUri.scheme !== "file" ||
+            !changedDocumentUri.fsPath.toLowerCase().endsWith(".tex")
+        ) {
+            return this.parser.parseWorkspace();
+        }
+        const owningFolder = vscode.workspace.getWorkspaceFolder(changedDocumentUri);
+        if (!owningFolder || owningFolder.uri.fsPath !== workspaceFolder.uri.fsPath) {
+            return this.parser.parseWorkspace();
+        }
+
+        try {
+            const document =
+                await vscode.workspace.openTextDocument(changedDocumentUri);
+            const changedElements = this.parser.parseDocument(document);
+            const cachedElements = this.deserializeParseCacheElements(
+                parseCache.elements
+            ).filter((entry) => entry.filePath !== changedDocumentUri.fsPath);
+            const merged = [...cachedElements, ...changedElements];
+            merged.sort((a, b) => this.compareDocumentElements(a, b));
+            return merged;
+        } catch (error) {
+            console.error("Failed to parse saved .tex incrementally:", error);
+            return this.parser.parseWorkspace();
+        }
+    }
+
+    private deserializeParseCacheElements(
+        entries: Record<string, CachedElement>
+    ): DocumentElement[] {
+        return Object.values(entries).map((entry) => ({
+            type: entry.type,
+            content: entry.content,
+            filePath: entry.filePath,
+            range: new vscode.Range(
+                new vscode.Position(
+                    entry.range.start.line,
+                    entry.range.start.character
+                ),
+                new vscode.Position(entry.range.end.line, entry.range.end.character)
+            ),
+            metadata: entry.metadata,
+        }));
+    }
+
+    private compareDocumentElements(
+        left: DocumentElement,
+        right: DocumentElement
+    ): number {
+        const byPath = left.filePath.localeCompare(right.filePath);
+        if (byPath !== 0) {
+            return byPath;
+        }
+        const byStartLine = left.range.start.line - right.range.start.line;
+        if (byStartLine !== 0) {
+            return byStartLine;
+        }
+        const byStartCharacter =
+            left.range.start.character - right.range.start.character;
+        if (byStartCharacter !== 0) {
+            return byStartCharacter;
+        }
+        const byEndLine = left.range.end.line - right.range.end.line;
+        if (byEndLine !== 0) {
+            return byEndLine;
+        }
+        const byEndCharacter = left.range.end.character - right.range.end.character;
+        if (byEndCharacter !== 0) {
+            return byEndCharacter;
+        }
+        return left.type.localeCompare(right.type);
+    }
+
+    private isAutoAnalyzeOnSaveEnabled(): boolean {
+        return vscode.workspace
+            .getConfiguration("thesisChecker")
+            .get<boolean>("autoAnalyzeOnSave.enabled", false);
+    }
+
+    private getAutoAnalyzeDebounceMs(): number {
+        const raw = vscode.workspace
+            .getConfiguration("thesisChecker")
+            .get<number>("autoAnalyzeOnSave.debounceMs", 800);
+        if (typeof raw !== "number" || Number.isNaN(raw)) {
+            return 800;
+        }
+        return Math.max(0, Math.floor(raw));
+    }
+
+    private shouldAutoAnalyzeOnSave(document: vscode.TextDocument): boolean {
+        if (!this.isAutoAnalyzeOnSaveEnabled()) {
+            return false;
+        }
+        if (document.isUntitled || document.uri.scheme !== "file") {
+            return false;
+        }
+        if (!document.fileName.toLowerCase().endsWith(".tex")) {
+            return false;
+        }
+        return Boolean(vscode.workspace.getWorkspaceFolder(document.uri));
+    }
+
+    private getLlmConfigSignature(): string {
+        const settings = vscode.workspace
+            .getConfiguration("thesisChecker")
+            .get<Record<string, unknown>>("llm");
+        const normalized = {
+            provider:
+                typeof settings?.provider === "string"
+                    ? settings.provider.trim()
+                    : "",
+            reviewMode:
+                typeof settings?.reviewMode === "string"
+                    ? settings.reviewMode.trim()
+                    : "",
+            openaiModel:
+                typeof settings?.openaiModel === "string"
+                    ? settings.openaiModel.trim()
+                    : "",
+            openaiBaseUrl:
+                typeof settings?.openaiBaseUrl === "string"
+                    ? settings.openaiBaseUrl.trim()
+                    : "",
+            ollamaEndpoint:
+                typeof settings?.ollamaEndpoint === "string"
+                    ? settings.ollamaEndpoint.trim()
+                    : "",
+            ollamaModel:
+                typeof settings?.ollamaModel === "string"
+                    ? settings.ollamaModel.trim()
+                    : "",
+        };
+        return JSON.stringify(normalized);
+    }
+
     private filterCachedLlmEntries(
         cache: DiagnosticsCache | undefined,
         recheckKeys: Set<string>,
@@ -1118,6 +1348,9 @@ class ThesisCheckerController implements vscode.Disposable {
     }
 
     public dispose(): void {
+        if (this.autoAnalyzeTimer) {
+            clearTimeout(this.autoAnalyzeTimer);
+        }
         this.statusBarItem.dispose();
     }
 }
@@ -1165,6 +1398,23 @@ interface DiagnosticsCache {
     generatedAt: string;
     diagnostics: CachedDiagnostic[];
     elementKeys?: string[];
+    llmConfigSignature?: string;
 }
 
 type AnalysisMode = "full" | "parse" | "logic" | "llm";
+type AnalysisTrigger = "manual" | "autoSave";
+
+interface RunFullAnalysisOptions {
+    force?: boolean;
+    mode?: AnalysisMode;
+    trigger?: AnalysisTrigger;
+    changedDocumentUri?: vscode.Uri;
+}
+
+interface ParseElementsOptions {
+    workspaceFolder?: vscode.WorkspaceFolder;
+    parseCache?: ParseCache;
+    force: boolean;
+    trigger: AnalysisTrigger;
+    changedDocumentUri?: vscode.Uri;
+}
