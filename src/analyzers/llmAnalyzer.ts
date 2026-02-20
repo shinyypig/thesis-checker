@@ -80,6 +80,15 @@ const FUNCTION_WORDS = new Set([
     "和",
     "及",
     "中",
+    "可",
+    "来",
+    "让",
+    "由",
+    "被",
+    "把",
+    "并",
+    "且",
+    "则",
 ]);
 
 function normalizeReviewContent(value: string): string {
@@ -359,11 +368,16 @@ function isCorrectedFragmentAlreadyPresent(
     message: string,
     content: string
 ): boolean {
-    if (!/错别字|拼写错误|笔误|错字/.test(message)) {
-        return false;
-    }
     const fragments = extractQuotedFragments(message);
     if (!fragments || fragments.before === fragments.after) {
+        return false;
+    }
+    // Insert/delete style fixes (including duplicated words) naturally contain
+    // the corrected fragment, so this check should not suppress them.
+    if (
+        fragments.before.includes(fragments.after) ||
+        fragments.after.includes(fragments.before)
+    ) {
         return false;
     }
     return content.includes(fragments.after);
@@ -408,9 +422,13 @@ function extractDifferenceSegment(longer: string, shorter: string): string | und
 }
 
 function isAllowedIssueType(message: string): boolean {
-    return /【(错别字|拼写错误|笔误|错字|重复)】/.test(
+    return /【(语病|语序不当|搭配不当|成分残缺|句式杂糅|结构混乱)】/.test(
         message
     );
+}
+
+function containsFunctionWord(value: string): boolean {
+    return [...value].some((char) => FUNCTION_WORDS.has(char));
 }
 
 function editDistance(a: string, b: string): number {
@@ -465,14 +483,23 @@ function isConcreteIssue(message: string, mode: LLMReviewMode): boolean {
     }
 
     const isLowFalsePositive = mode === "lowFalsePositive";
-    const isTypos = /错别字|拼写错误|笔误|错字/.test(trimmed);
-    const isRepeatOrRedundant = /重复|多余/.test(trimmed);
+    const isGrammarIssue = /语病|语序不当|搭配不当|成分残缺|句式杂糅|结构混乱/.test(
+        trimmed
+    );
 
-    if (isTypos) {
+    if (isGrammarIssue) {
         if (
             containsLatinOrLatex(fragments.before) ||
             containsLatinOrLatex(fragments.after)
         ) {
+            return false;
+        }
+        const beforeLen = [...fragments.before].length;
+        const afterLen = [...fragments.after].length;
+        if (beforeLen > 15 || afterLen > 15) {
+            return false;
+        }
+        if (beforeLen <= 1 || afterLen <= 1) {
             return false;
         }
         if (
@@ -482,38 +509,13 @@ function isConcreteIssue(message: string, mode: LLMReviewMode): boolean {
             return false;
         }
 
-        if (isLowFalsePositive) {
-            // Keep precision high: only accept "missing-character" fixes,
-            // i.e. corrected fragment must contain the original fragment.
-            if (!fragments.after.includes(fragments.before)) {
-                return false;
-            }
-            const delta = extractDifferenceSegment(
-                fragments.after,
-                fragments.before
-            );
-            if (!delta) {
-                return false;
-            }
-            const deltaChars = [...delta];
-            if (deltaChars.length !== 1) {
-                return false;
-            }
-            if (
-                deltaChars.some((char) => !/[\p{Letter}\p{Number}]/u.test(char))
-            ) {
-                return false;
-            }
-            if (deltaChars.every((char) => FUNCTION_WORDS.has(char))) {
-                return false;
-            }
-            return true;
-        }
-
         const insertionDeletion =
             fragments.before.includes(fragments.after) ||
             fragments.after.includes(fragments.before);
         if (insertionDeletion) {
+            if (isExactDuplication(fragments.before, fragments.after)) {
+                return true;
+            }
             const longer =
                 fragments.before.length >= fragments.after.length
                     ? fragments.before
@@ -527,7 +529,8 @@ function isConcreteIssue(message: string, mode: LLMReviewMode): boolean {
                 return false;
             }
             const deltaChars = [...delta];
-            if (deltaChars.length !== 1) {
+            const maxDelta = isLowFalsePositive ? 2 : 3;
+            if (deltaChars.length > maxDelta) {
                 return false;
             }
             if (
@@ -535,38 +538,31 @@ function isConcreteIssue(message: string, mode: LLMReviewMode): boolean {
             ) {
                 return false;
             }
-            if (deltaChars.every((char) => FUNCTION_WORDS.has(char))) {
+            if (!deltaChars.every((char) => FUNCTION_WORDS.has(char))) {
                 return false;
             }
             return true;
         }
 
-        if (editDistance(fragments.before, fragments.after) !== 1) {
+        // Grammar mode: avoid synonym substitutions; keep only tiny fixes.
+        const maxDistance = isLowFalsePositive ? 2 : 3;
+        if (editDistance(fragments.before, fragments.after) > maxDistance) {
             return false;
         }
-        const beforeChars = [...fragments.before];
-        const afterChars = [...fragments.after];
-        if (beforeChars.length !== afterChars.length) {
+        if (fragments.before.length > 4 || fragments.after.length > 4) {
             return false;
         }
-        const mismatchPairs = beforeChars
-            .map((char, index) => ({ before: char, after: afterChars[index] }))
-            .filter((pair) => pair.before !== pair.after);
-        if (mismatchPairs.length !== 1) {
-            return false;
-        }
-        const [pair] = mismatchPairs;
         if (
-            FUNCTION_WORDS.has(pair.before) &&
-            FUNCTION_WORDS.has(pair.after)
+            fragments.before.length >= 3 &&
+            fragments.after.length >= 3 &&
+            fragments.before.length === fragments.after.length
         ) {
             return false;
         }
-        return true;
-    }
-
-    if (isRepeatOrRedundant) {
-        if (!isExactDuplication(fragments.before, fragments.after)) {
+        if (
+            !containsFunctionWord(fragments.before) &&
+            !containsFunctionWord(fragments.after)
+        ) {
             return false;
         }
         return true;
@@ -700,11 +696,10 @@ export class LLMAnalyzer {
                     isStyleIssue(issue.message) ||
                     isKeyValueLikeIssue(issue.message) ||
                     isQuotedFragmentMissing(issue.message, element.content) ||
-                    (reviewMode === "lowFalsePositive" &&
-                        isCorrectedFragmentAlreadyPresent(
-                            issue.message,
-                            element.content
-                        )) ||
+                    isCorrectedFragmentAlreadyPresent(
+                        issue.message,
+                        element.content
+                    ) ||
                     isFunctionWordSwap(issue.message) ||
                     isStopWordSingleReplacement(issue.message) ||
                     !isConcreteIssue(issue.message, reviewMode)
