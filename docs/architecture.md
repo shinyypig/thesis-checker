@@ -53,7 +53,7 @@
 ### LLM Analyzer Module (`src/analyzers/llmAnalyzer.ts`)
 
 -   Provider interface currently implemented for OpenAI-compatible chat completions and Ollama’s HTTP API.
--   Samples the first N sentences/equations (configurable) to keep prompt volume manageable.
+-   Analyzes all eligible sentence elements selected by the incremental cache strategy.
 -   Prompts providers to respond with strict `key=value` lines (`issue_count`, `issue*_severity`, `issue*_message`, `rewrite`) for more stable parsing; parsed results become diagnostics labeled `LLM:<provider>`.
 -   Emits `vscode.Diagnostic` entries so LLM findings underline source next to deterministic checks.
 

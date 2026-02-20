@@ -220,7 +220,6 @@ class ThesisCheckerController implements vscode.Disposable {
                               )
                             : new Set(currentSentenceKeys)
                         : new Set<string>();
-                    const llmMaxItems = runLlm ? this.getLlmMaxItems() : 0;
                     const llmTargets = runLlm
                         ? sentenceElements
                               .filter((element) =>
@@ -228,7 +227,6 @@ class ThesisCheckerController implements vscode.Disposable {
                                       this.buildElementKey(element)
                                   )
                               )
-                              .slice(0, llmMaxItems)
                         : [];
                     const llmReviewKeys = new Set(
                         llmTargets.map((element) =>
@@ -598,16 +596,6 @@ class ThesisCheckerController implements vscode.Disposable {
     private formatAnalyzedSummary(count: number): string {
         const label = count === 1 ? "item" : "items";
         return `${count} ${label} analyzed`;
-    }
-
-    private getLlmMaxItems(): number {
-        const configured = vscode.workspace
-            .getConfiguration("thesisChecker")
-            .get<number>("llm.maxItems", 20);
-        if (!Number.isFinite(configured)) {
-            return 20;
-        }
-        return Math.max(1, Math.floor(configured));
     }
 
     private buildElementCache(

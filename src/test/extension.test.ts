@@ -28,7 +28,7 @@ suite('Thesis Checker Test Suite', () => {
 		const analyzer = new LogicAnalyzer();
 		const element: DocumentElement = {
 			type: 'sentence',
-			content: 'ML 模型广泛应用。',
+			content: 'CNN 模型广泛应用。',
 			filePath: '/tmp/acronym.tex',
 			range: new vscode.Range(new vscode.Position(0, 0), new vscode.Position(0, 8))
 		};

@@ -32,6 +32,38 @@ interface LLMReviewResult {
     raw?: string;
 }
 
+class LLMProviderFatalError extends Error {
+    public readonly userNotified: boolean;
+
+    constructor(message: string, userNotified = false) {
+        super(message);
+        this.name = "LLMProviderFatalError";
+        this.userNotified = userNotified;
+    }
+}
+
+function extractApiErrorMessage(payload: string): string | undefined {
+    const trimmed = payload.trim();
+    if (!trimmed) {
+        return undefined;
+    }
+    try {
+        const parsed = JSON.parse(trimmed) as {
+            error?: { message?: unknown };
+            message?: unknown;
+        };
+        if (typeof parsed.error?.message === "string") {
+            return parsed.error.message;
+        }
+        if (typeof parsed.message === "string") {
+            return parsed.message;
+        }
+    } catch {
+        // Non-JSON response body, keep raw text fallback.
+    }
+    return trimmed;
+}
+
 const FUNCTION_WORDS = new Set([
     "即",
     "将",
@@ -44,6 +76,7 @@ const FUNCTION_WORDS = new Set([
     "与",
     "和",
     "及",
+    "中",
 ]);
 
 function normalizeReviewContent(value: string): string {
@@ -319,6 +352,20 @@ function isQuotedFragmentMissing(message: string, content: string): boolean {
     return !content.includes(fragments.before);
 }
 
+function isCorrectedFragmentAlreadyPresent(
+    message: string,
+    content: string
+): boolean {
+    if (!/错别字|拼写错误|笔误|错字/.test(message)) {
+        return false;
+    }
+    const fragments = extractQuotedFragments(message);
+    if (!fragments || fragments.before === fragments.after) {
+        return false;
+    }
+    return content.includes(fragments.after);
+}
+
 function isFunctionWordSwap(message: string): boolean {
     const fragments = extractQuotedFragments(message);
     if (!fragments || fragments.before === fragments.after) {
@@ -345,31 +392,22 @@ function containsLatinOrLatex(value: string): boolean {
     return /[A-Za-z]/.test(value) || /\\/.test(value);
 }
 
-function editDistance(a: string, b: string): number {
-    const dp: number[][] = Array.from({ length: a.length + 1 }, () =>
-        new Array(b.length + 1).fill(0)
-    );
-    for (let i = 0; i <= a.length; i += 1) {
-        dp[i][0] = i;
-    }
-    for (let j = 0; j <= b.length; j += 1) {
-        dp[0][j] = j;
-    }
-    for (let i = 1; i <= a.length; i += 1) {
-        for (let j = 1; j <= b.length; j += 1) {
-            const cost = a[i - 1] === b[j - 1] ? 0 : 1;
-            dp[i][j] = Math.min(
-                dp[i - 1][j] + 1,
-                dp[i][j - 1] + 1,
-                dp[i - 1][j - 1] + cost
-            );
-        }
-    }
-    return dp[a.length][b.length];
-}
-
 function isExactDuplication(before: string, after: string): boolean {
     return before === after + after || after === before + before;
+}
+
+function extractDifferenceSegment(longer: string, shorter: string): string | undefined {
+    const index = longer.indexOf(shorter);
+    if (index < 0) {
+        return undefined;
+    }
+    return `${longer.slice(0, index)}${longer.slice(index + shorter.length)}`;
+}
+
+function isAllowedIssueType(message: string): boolean {
+    return /【(错别字|拼写错误|笔误|错字|重复)】/.test(
+        message
+    );
 }
 
 function isConcreteIssue(message: string): boolean {
@@ -384,36 +422,68 @@ function isConcreteIssue(message: string): boolean {
     if (!hasExplicitReplacement(trimmed)) {
         return false;
     }
+    if (!isAllowedIssueType(trimmed)) {
+        return false;
+    }
     const fragments = extractQuotedFragments(trimmed);
     if (!fragments) {
         return false;
     }
-    if (
-        containsLatinOrLatex(fragments.before) ||
-        containsLatinOrLatex(fragments.after)
-    ) {
+    if (!fragments.before.trim() || !fragments.after.trim()) {
         return false;
     }
-    const typoSignal = /错别字|拼写错误|笔误|错字/.test(trimmed);
-    const repeatSignal = /重复|多余/.test(trimmed);
-    const insertionDeletion =
-        fragments.before.includes(fragments.after) ||
-        fragments.after.includes(fragments.before);
-    if (!insertionDeletion) {
-        const distance = editDistance(fragments.before, fragments.after);
-        if (!typoSignal || distance > 1) {
+    if (fragments.before === fragments.after) {
+        return false;
+    }
+
+    const isTypos = /错别字|拼写错误|笔误|错字/.test(trimmed);
+    const isRepeatOrRedundant = /重复|多余/.test(trimmed);
+
+    if (isTypos) {
+        if (
+            containsLatinOrLatex(fragments.before) ||
+            containsLatinOrLatex(fragments.after)
+        ) {
             return false;
         }
-    } else if (typoSignal) {
-        // Allow minimal insert/delete for clear typo fixes.
-    } else if (repeatSignal) {
+        if (
+            !/[\p{Letter}\p{Number}]/u.test(fragments.before) ||
+            !/[\p{Letter}\p{Number}]/u.test(fragments.after)
+        ) {
+            return false;
+        }
+        // Keep precision high: only accept "missing-character" fixes,
+        // i.e. corrected fragment must contain the original fragment.
+        if (!fragments.after.includes(fragments.before)) {
+            return false;
+        }
+        const delta = extractDifferenceSegment(
+            fragments.after,
+            fragments.before
+        );
+        if (!delta) {
+            return false;
+        }
+        const deltaChars = [...delta];
+        if (deltaChars.length !== 1) {
+            return false;
+        }
+        if (deltaChars.some((char) => !/[\p{Letter}\p{Number}]/u.test(char))) {
+            return false;
+        }
+        if (deltaChars.every((char) => FUNCTION_WORDS.has(char))) {
+            return false;
+        }
+        return true;
+    }
+
+    if (isRepeatOrRedundant) {
         if (!isExactDuplication(fragments.before, fragments.after)) {
             return false;
         }
-    } else {
-        return false;
+        return true;
     }
-    return true;
+    return false;
 }
 
 function hasRecognizedSeverity(issue: LLMIssue): boolean {
@@ -487,7 +557,23 @@ export class LLMAnalyzer {
             if (token?.isCancellationRequested) {
                 break;
             }
-            const result = await provider.review(element);
+            let result: LLMReviewResult | undefined;
+            try {
+                result = await provider.review(element);
+            } catch (error) {
+                const message =
+                    error instanceof Error ? error.message : String(error);
+                this.output.appendLine(
+                    `Stopping LLM analysis after provider error: ${message}`
+                );
+                if (
+                    !(error instanceof LLMProviderFatalError) ||
+                    !error.userNotified
+                ) {
+                    void vscode.window.showWarningMessage(message);
+                }
+                break;
+            }
             processed += 1;
             progress?.report({
                 message: `LLM analyzing ${processed}/${targets.length}`,
@@ -525,6 +611,10 @@ export class LLMAnalyzer {
                     isStyleIssue(issue.message) ||
                     isKeyValueLikeIssue(issue.message) ||
                     isQuotedFragmentMissing(issue.message, element.content) ||
+                    isCorrectedFragmentAlreadyPresent(
+                        issue.message,
+                        element.content
+                    ) ||
                     isFunctionWordSwap(issue.message) ||
                     isStopWordSingleReplacement(issue.message) ||
                     !isConcreteIssue(issue.message)
@@ -586,6 +676,7 @@ export class LLMAnalyzer {
 
 class OpenAIProvider implements LLMProvider {
     public readonly id = "openai";
+    private hasShownUserWarning = false;
 
     constructor(
         private readonly settings: LLMSettings,
@@ -648,10 +739,11 @@ class OpenAIProvider implements LLMProvider {
 
             if (!response.ok) {
                 const details = await response.text();
-                this.output.appendLine(
-                    `OpenAI API error (${response.status}): ${details}`
-                );
-                return undefined;
+                const errorMessage = extractApiErrorMessage(details) ?? details;
+                const message = `OpenAI API error (${response.status}): ${errorMessage}`;
+                this.output.appendLine(message);
+                this.notifyUserWarningOnce(message);
+                throw new LLMProviderFatalError(message, true);
             }
 
             const data = await response.json();
@@ -663,9 +755,22 @@ class OpenAIProvider implements LLMProvider {
                 raw: content,
             };
         } catch (error) {
-            this.output.appendLine(`OpenAI request failed: ${String(error)}`);
-            return undefined;
+            if (error instanceof LLMProviderFatalError) {
+                throw error;
+            }
+            const message = `OpenAI request failed: ${String(error)}`;
+            this.output.appendLine(message);
+            this.notifyUserWarningOnce(message);
+            throw new LLMProviderFatalError(message, true);
         }
+    }
+
+    private notifyUserWarningOnce(message: string): void {
+        if (this.hasShownUserWarning) {
+            return;
+        }
+        this.hasShownUserWarning = true;
+        void vscode.window.showWarningMessage(message);
     }
 
     private normalizeUrl(url: string): string {
@@ -678,6 +783,12 @@ class OpenAIProvider implements LLMProvider {
                     parsed.pathname = "/api/v1/";
                 } else if (parsed.pathname.startsWith("/v1/")) {
                     parsed.pathname = `/api${parsed.pathname}`;
+                }
+                if (
+                    parsed.pathname === "/api/v1" ||
+                    parsed.pathname === "/api/v1/"
+                ) {
+                    parsed.pathname = "/api/v1/chat/completions";
                 }
             }
             return parsed.toString();
@@ -726,10 +837,9 @@ class OllamaProvider implements LLMProvider {
             });
             if (!response.ok) {
                 const text = await response.text();
-                this.output.appendLine(
-                    `Ollama API error (${response.status}): ${text}`
-                );
-                return undefined;
+                const message = `Ollama API error (${response.status}): ${text}`;
+                this.output.appendLine(message);
+                throw new LLMProviderFatalError(message);
             }
             const data = await response.json();
             return {
@@ -738,8 +848,12 @@ class OllamaProvider implements LLMProvider {
                 raw: data.response,
             };
         } catch (error) {
-            this.output.appendLine(`Ollama request failed: ${String(error)}`);
-            return undefined;
+            if (error instanceof LLMProviderFatalError) {
+                throw error;
+            }
+            const message = `Ollama request failed: ${String(error)}`;
+            this.output.appendLine(message);
+            throw new LLMProviderFatalError(message);
         }
     }
 
