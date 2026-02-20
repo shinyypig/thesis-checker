@@ -17,7 +17,8 @@ interface LogicIncrementalPlan {
     elementKeyFor: (element: DocumentElement) => string;
 }
 
-const SENTENCE_PUNCTUATION_REGEX = /[.!?。？！：:；;]/u;
+const TERMINAL_PUNCTUATION_REGEX = /[.!?。？！：:；;]$/u;
+const TRAILING_CLOSERS_REGEX = /[)\]）】》」』”"'`]+$/u;
 const ACRONYM_HINT_EXAMPLE = "应当给出全称。";
 const MIN_ACRONYM_LENGTH = 3;
 const ENUMERATED_DEFINITION_HINT = /分别.*?(代表|表示|指|是)/u;
@@ -112,7 +113,7 @@ export class LogicAnalyzer {
                 continue;
             }
 
-            if (!SENTENCE_PUNCTUATION_REGEX.test(value)) {
+            if (!this.hasSentenceTerminalPunctuation(value)) {
                 const diagnostic = new vscode.Diagnostic(
                     element.range,
                     "句子缺少句末标点。",
@@ -127,6 +128,14 @@ export class LogicAnalyzer {
         }
 
         return diagnostics;
+    }
+
+    private hasSentenceTerminalPunctuation(value: string): boolean {
+        const normalized = value.trim().replace(TRAILING_CLOSERS_REGEX, "");
+        if (!normalized) {
+            return false;
+        }
+        return TERMINAL_PUNCTUATION_REGEX.test(normalized);
     }
 
     private checkAbbreviations(

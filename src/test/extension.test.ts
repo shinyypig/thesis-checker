@@ -19,7 +19,7 @@ suite('Thesis Checker Test Suite', () => {
 
 		const diagnostics = analyzer.analyze([element]);
 		assert.ok(
-			diagnostics.some((entry) => entry.diagnostic.message.includes('punctuation')),
+			diagnostics.some((entry) => entry.diagnostic.message.includes('句末标点')),
 			'Expected punctuation diagnostic to be emitted.'
 		);
 	});
@@ -38,7 +38,7 @@ suite('Thesis Checker Test Suite', () => {
 			diagnostics.some(
 				(entry) =>
 					entry.diagnostic.code === 'ACRONYM_FIRST_USE' &&
-					entry.diagnostic.message.includes('缩写首次出现，应当给出全称')
+					/缩写.*首次出现.*应当给出全称/.test(entry.diagnostic.message)
 			),
 			'Expected missing acronym definition diagnostic.'
 		);
@@ -58,7 +58,7 @@ suite('Thesis Checker Test Suite', () => {
 		assert.strictEqual(acronymDiagnostics.length, 0, 'Inline acronym definition should not trigger warnings.');
 	});
 
-	test('Workspace scan command produces structured JSON output', async () => {
+	test('Workspace parse command produces structured cache output', async () => {
 		let workspaceFolder = vscode.workspace.workspaceFolders?.[0];
 		if (!workspaceFolder) {
 			const repoRoot = path.resolve(__dirname, '..', '..');
@@ -68,22 +68,31 @@ suite('Thesis Checker Test Suite', () => {
 		}
 		assert.ok(workspaceFolder, 'Workspace folder should be defined for integration test.');
 		const outputDir = path.join(workspaceFolder.uri.fsPath, '.vscode', 'thesis-checker');
-		const cacheFile = path.join(outputDir, 'cache.json');
+		const cacheFile = path.join(outputDir, 'parse.current.json');
 		await fs.rm(cacheFile, { force: true });
 
-		await vscode.commands.executeCommand('thesis-checker.scanWorkspace');
+		await vscode.commands.executeCommand('thesis-checker.parseWorkspaceRescan');
 
 		const raw = await fs.readFile(cacheFile, 'utf8');
-		const data = JSON.parse(raw) as Array<{ type: string; content: string; file: string }>;
-		assert.ok(Array.isArray(data) && data.length > 0, 'Expected structured data from parser.');
+		const parsed = JSON.parse(raw) as {
+			elements?: Record<string, { type: string; content: string; filePath: string }>;
+		};
+		const data = Object.values(parsed.elements ?? {});
+		assert.ok(data.length > 0, 'Expected structured data from parser.');
 
 		// Log a quick preview to help manual inspection when running the test suite.
 		const preview = data
 			.slice(0, 5)
-			.map((entry) => `${entry.type.padEnd(10)} | ${entry.file} | ${entry.content.slice(0, 40)}`);
+			.map((entry) => {
+				const file = path.relative(workspaceFolder.uri.fsPath, entry.filePath);
+				return `${entry.type.padEnd(10)} | ${file} | ${entry.content.slice(0, 40)}`;
+			});
 		console.log('Thesis Checker sample output:\n' + preview.join('\n'));
 
-		const hasTestThesisContent = data.some((entry) => entry.file.startsWith('test_thesis'));
+		const hasTestThesisContent = data.some((entry) => {
+			const relative = path.relative(workspaceFolder.uri.fsPath, entry.filePath);
+			return relative.split(path.sep)[0] === 'test_thesis';
+		});
 		assert.ok(hasTestThesisContent, 'Structured output should include entries from test_thesis.');
 	});
 });

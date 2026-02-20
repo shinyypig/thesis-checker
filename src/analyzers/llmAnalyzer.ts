@@ -14,7 +14,6 @@ interface LLMSettings {
     openaiBaseUrl?: string;
     ollamaEndpoint?: string;
     ollamaModel?: string;
-    maxItems?: number;
 }
 
 interface LLMIssue {
@@ -32,6 +31,20 @@ interface LLMReviewResult {
     prompt: string | { system: string; user: string };
     raw?: string;
 }
+
+const FUNCTION_WORDS = new Set([
+    "即",
+    "将",
+    "的",
+    "地",
+    "得",
+    "了",
+    "在",
+    "对",
+    "与",
+    "和",
+    "及",
+]);
 
 function normalizeReviewContent(value: string): string {
     const trimmed = value.trim();
@@ -143,7 +156,7 @@ function parseCombinedIssueValue(value: string): LLMIssue | undefined {
         .map((part) => part.trim())
         .filter((part) => part.length > 0);
     if (pipeParts.length >= 2) {
-        const severity = normalizeSeverityLabel(pipeParts[0]);
+        const severity = normalizeSeverityLabel(pipeParts[0]) ?? "warning";
         const message = pipeParts.slice(1).join("|").trim();
         return message ? { message, severity } : undefined;
     }
@@ -154,11 +167,11 @@ function parseCombinedIssueValue(value: string): LLMIssue | undefined {
     if (levelAndMessage?.[2]) {
         return {
             message: levelAndMessage[2].trim(),
-            severity: normalizeSeverityLabel(levelAndMessage[1]),
+            severity: normalizeSeverityLabel(levelAndMessage[1]) ?? "warning",
         };
     }
 
-    return { message: trimmed };
+    return { message: trimmed, severity: "warning" };
 }
 
 function parseIndexedIssue(
@@ -183,9 +196,9 @@ function parseIndexedIssue(
     if (message) {
         return {
             message,
-            severity: normalizeSeverityLabel(
-                getFirstMatch(pairs, severityAliases)
-            ),
+            severity:
+                normalizeSeverityLabel(getFirstMatch(pairs, severityAliases)) ??
+                "warning",
         };
     }
     const combined = getFirstMatch(pairs, combinedAliases);
@@ -221,9 +234,10 @@ function parseKeyValueReview(value: string): LLMReview | undefined {
         if (singleMessage) {
             issues.push({
                 message: singleMessage,
-                severity: normalizeSeverityLabel(
-                    getFirstMatch(pairs, ["issue_severity", "severity"])
-                ),
+                severity:
+                    normalizeSeverityLabel(
+                        getFirstMatch(pairs, ["issue_severity", "severity"])
+                    ) ?? "warning",
             });
         }
     }
@@ -310,20 +324,10 @@ function isFunctionWordSwap(message: string): boolean {
     if (!fragments || fragments.before === fragments.after) {
         return false;
     }
-    const stopWords = new Set([
-        "即",
-        "将",
-        "的",
-        "地",
-        "得",
-        "了",
-        "在",
-        "对",
-        "与",
-        "和",
-        "及",
-    ]);
-    return stopWords.has(fragments.before) && stopWords.has(fragments.after);
+    return (
+        FUNCTION_WORDS.has(fragments.before) &&
+        FUNCTION_WORDS.has(fragments.after)
+    );
 }
 
 function isStopWordSingleReplacement(message: string): boolean {
@@ -331,20 +335,10 @@ function isStopWordSingleReplacement(message: string): boolean {
     if (!fragments || fragments.before === fragments.after) {
         return false;
     }
-    const stopWords = new Set([
-        "即",
-        "将",
-        "的",
-        "地",
-        "得",
-        "了",
-        "在",
-        "对",
-        "与",
-        "和",
-        "及",
-    ]);
-    return fragments.before.length === 1 && stopWords.has(fragments.before);
+    return (
+        fragments.before.length === 1 &&
+        FUNCTION_WORDS.has(fragments.before)
+    );
 }
 
 function containsLatinOrLatex(value: string): boolean {

@@ -10,7 +10,7 @@
 
 ### Extension Core (`src/extension.ts`)
 
--   Commands: `thesis-checker.scanWorkspace` (runs parsing + analyses) and `thesis-checker.exportStructure` (writes the last parse result).
+-   Commands: `thesis-checker.scanWorkspace` (runs parsing + analyses), dedicated parse/logic/LLM commands, and `thesis-checker.exportStructure` (writes the last parse result).
 -   Shows a status bar entry and uses notifications/progress UI while the pipeline executes.
 -   Coordinates parser → JSON serialization → logic analyzer → LLM analyzer, storing the last `DocumentElement[]` snapshot.
 -   Maintains a `vscode.DiagnosticCollection` so logic/LLM issues underline LaTeX source.
@@ -38,7 +38,7 @@
         ]
         ```
     - Array order mirrors the LaTeX source so downstream modules can stream through content sequentially.
-    - Saved under `.vscode/thesis-checker/cache.json` and exposed in-memory for analyzers/commands.
+    - Saved under `.vscode/thesis-checker/parse.current.json` (with `parse.prev.json` as baseline) and exposed in-memory for analyzers/commands.
 
 ### Logic Analyzer Module (`src/analyzers/logicAnalyzer.ts`)
 
@@ -54,13 +54,13 @@
 
 -   Provider interface currently implemented for OpenAI-compatible chat completions and Ollama’s HTTP API.
 -   Samples the first N sentences/equations (configurable) to keep prompt volume manageable.
--   Prompts providers to respond with JSON `{ "issues": [{ "message": "...", "severity": "warning" }] }`; parsed results become diagnostics labeled `LLM:<provider>`.
+-   Prompts providers to respond with strict `key=value` lines (`issue_count`, `issue*_severity`, `issue*_message`, `rewrite`) for more stable parsing; parsed results become diagnostics labeled `LLM:<provider>`.
 -   Emits `vscode.Diagnostic` entries so LLM findings underline source next to deterministic checks.
 
 ### Results Presentation
 
 -   **Diagnostics**: Both analyzers push findings to the shared `DiagnosticCollection`, underlining problematic LaTeX in editors and listing issues in the Problems panel.
--   **JSON Cache**: Latest parse result is persisted at `.vscode/thesis-checker/cache.json` for downstream tooling or inspection.
+-   **JSON Cache**: Latest parse result is persisted at `.vscode/thesis-checker/parse.current.json` (plus `.prev` snapshots) for downstream tooling or inspection.
 -   **Commands/Status Bar**: Command palette entries and the status bar button trigger re-runs or export without rerunning analysis.
 
 ## Data Flow Summary

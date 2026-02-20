@@ -220,6 +220,21 @@ class ThesisCheckerController implements vscode.Disposable {
                               )
                             : new Set(currentSentenceKeys)
                         : new Set<string>();
+                    const llmMaxItems = runLlm ? this.getLlmMaxItems() : 0;
+                    const llmTargets = runLlm
+                        ? sentenceElements
+                              .filter((element) =>
+                                  llmRecheckKeys.has(
+                                      this.buildElementKey(element)
+                                  )
+                              )
+                              .slice(0, llmMaxItems)
+                        : [];
+                    const llmReviewKeys = new Set(
+                        llmTargets.map((element) =>
+                            this.buildElementKey(element)
+                        )
+                    );
                     let changedSentenceKeys = new Set<string>();
                     let changedCaptionKeys = new Set<string>();
                     let sectionFilesToRecheck = new Set<string>();
@@ -325,7 +340,7 @@ class ThesisCheckerController implements vscode.Disposable {
                     const cachedLlmEntries = llmCacheAvailable
                         ? this.filterCachedLlmEntries(
                               llmCache,
-                              llmRecheckKeys,
+                              llmReviewKeys,
                               currentSentenceKeys
                           )
                         : [];
@@ -418,11 +433,6 @@ class ThesisCheckerController implements vscode.Disposable {
                         ...logicDiagnostics,
                     ];
                     const streamingLlmDiagnostics: AnalyzerDiagnostic[] = [];
-                    const llmTargets = runLlm
-                        ? sentenceElements.filter((element) =>
-                              llmRecheckKeys.has(this.buildElementKey(element))
-                          )
-                        : [];
                     const llmDiagnostics = runLlm
                         ? await this.llmAnalyzer.analyze(llmTargets, {
                               progress,
@@ -590,15 +600,23 @@ class ThesisCheckerController implements vscode.Disposable {
         return `${count} ${label} analyzed`;
     }
 
+    private getLlmMaxItems(): number {
+        const configured = vscode.workspace
+            .getConfiguration("thesisChecker")
+            .get<number>("llm.maxItems", 20);
+        if (!Number.isFinite(configured)) {
+            return 20;
+        }
+        return Math.max(1, Math.floor(configured));
+    }
+
     private buildElementCache(
         elements: DocumentElement[],
         cache?: ParseCache
     ): ElementCacheResult {
         const entries: Record<string, CachedElement> = {};
-        const changedElements: DocumentElement[] = [];
         const unchangedKeys = new Set<string>();
         const newKeys = new Set<string>();
-        const modifiedKeys = new Set<string>();
         const previous = cache?.elements ?? {};
 
         for (const element of elements) {
@@ -615,24 +633,18 @@ class ThesisCheckerController implements vscode.Disposable {
 
             if (!previous[key]) {
                 newKeys.add(key);
-                changedElements.push(element);
             } else if (previous[key]?.hash === hash) {
                 unchangedKeys.add(key);
-            } else {
-                modifiedKeys.add(key);
-                changedElements.push(element);
             }
         }
 
         const removedKeys = new Set<string>();
-        const removedFiles = new Set<string>();
         let removedSentence = false;
         for (const [key, entry] of Object.entries(previous)) {
             if (entries[key]) {
                 continue;
             }
             removedKeys.add(key);
-            removedFiles.add(entry.filePath);
             if (entry.type === "sentence") {
                 removedSentence = true;
             }
@@ -640,12 +652,9 @@ class ThesisCheckerController implements vscode.Disposable {
 
         return {
             entries,
-            changedElements,
             unchangedKeys,
             newKeys,
-            modifiedKeys,
             removedKeys,
-            removedFiles,
             removedSentence,
         };
     }
@@ -1132,12 +1141,9 @@ interface CachedRange {
 
 interface ElementCacheResult {
     entries: Record<string, CachedElement>;
-    changedElements: DocumentElement[];
     unchangedKeys: Set<string>;
     newKeys: Set<string>;
-    modifiedKeys: Set<string>;
     removedKeys: Set<string>;
-    removedFiles: Set<string>;
     removedSentence: boolean;
 }
 
